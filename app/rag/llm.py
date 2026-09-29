@@ -50,10 +50,25 @@ class MockLLM:
             )
         if not evidence:
             return "检索结果中没有相关资料，无法回答。"
-        # 证据摘录型：取前两条含数字的证据句，附原始引用编号
-        picked = [pair for pair in evidence if re.search(r"\d", pair[1])][:2] or evidence[:2]
-        body = "".join(f"{i + 1}. {s}[{cid}]" for i, (cid, s) in enumerate(picked))
-        return f"根据检索到的研报内容：{body}"
+        # 证据摘录型：优先选带金额小数（\d+\.\d+）的块——金融事实的数字
+        # 都长这样；只含列表序号 1. 的风险提示块不是有效证据（早期版本因此
+        # 把序号当数字引用，被校验判无引用拒答）
+        money = [pair for pair in evidence if re.search(r"\d+\.\d+", pair[1])]
+        picked = money[:2] or [pair for pair in evidence if re.search(r"\d", pair[1])][:2]
+        # 逐句加引用：一段证据有多个句子时，引用必须跟在每句后面——
+        # 只在段尾放一个 [cN]，前面的句子会被断句判成无引用数字论断
+        parts = []
+        for i, (cid, s) in enumerate(picked):
+            sentences = [x for x in re.split(r"(?<=[。；;])", s) if x.strip()]
+            cited = (
+                "".join(f"{sent}[{cid}]" for sent in sentences)
+                if sentences
+                else f"{s}[{cid}]"
+            )
+            parts.append(f"{i + 1}. {cited}")
+        # 引导语以句号收尾：否则断句会把引导语和第一个论断粘成一句，
+        # 引导语被当成必须出现在证据里的词（实测误杀）
+        return "根据检索到的研报内容。" + "".join(parts)
 
 
 class OpenAILLM:

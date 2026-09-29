@@ -86,8 +86,27 @@ async def hybrid_search(
     top_k = top_k or settings.retrieve_top_k
     qv = embed_query(question)
     vector_rows = await store.vector_search(qv, top_k=settings.retrieve_top_k, industry=industry)
+    # IDF 加权：稀有词（指标名）比常见词（公司名）更能定位到正确块——
+    # 评测实测：没有 IDF 时问"归母净利润"捞回的是只写营业收入的概况块，
+    # answer_accuracy 卡在 63%
+    from app.rag.store import (
+        _extract_terms,
+        boost_metric_terms,
+        idf_weights,
+        term_df,
+    )
+
+    terms = _extract_terms(question)[:12]
+    pool = store.get_pool()
+    async with pool.acquire() as conn:
+        n_docs = await conn.fetchval("SELECT count(*) FROM rag.chunks")
+    df = await term_df(terms)
+    weights = idf_weights(terms, df, n_docs)
+    # 指标词加权：查询的意图核心是指标（归母净利润），不是公司名——
+    # 公司名只定位文档，指标才定位到真正回答问题的块
+    weights = boost_metric_terms(question, weights)
     keyword_rows = await store.keyword_search(
-        question, top_k=settings.retrieve_keyword_k, industry=industry
+        question, top_k=settings.retrieve_keyword_k, industry=industry, weights=weights
     )
     # mock 模式：哈希向量不携带语义，把它混进排序只会用噪声稀释真实命中，
     # 所以向量权重归零、走纯关键词路——mock 冒烟因此能验证真实召回逻辑。

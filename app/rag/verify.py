@@ -93,12 +93,35 @@ def verify_answer(
 
 
 def _missing_evidence(claim: str, evidence: str) -> list[str]:
-    """论断里找不到依据的成分：数字优先，再查 2 字以上中文实词。"""
+    """论断里找不到依据的成分。
+
+    两层检查，严格程度不同：
+    1. 数字（硬门禁）：论断里的每个数字都必须在被引证据里——模型编的
+       数字几乎不可能恰好出现在语料里，这一层拦最高危的幻觉。
+    2. 内容词（软门禁）：把论断切中文二元组，至少 2 个要能在证据里
+       找到——防止"数字碰巧对上但话题完全不对"的张冠李戴。
+       软门禁不要求全部命中：答案的引导语（"根据检索到的研报内容："）
+       不是论断内容，逐词要求全中会把正常答案误杀（实测踩坑）。
+    """
     missing: list[str] = []
     for num in _NUM.findall(claim):
         if num not in evidence:
             missing.append(num)
-    for term in re.findall(r"[一-龥]{2,}", claim):
-        if term not in evidence and term not in ("根据", "研报", "内容", "检索", "资料"):
-            missing.append(term)
+    bigrams = _content_bigrams(claim)
+    hits = sum(1 for g in bigrams if g in evidence)
+    if bigrams and hits < 2:
+        missing.append(f"内容词命中不足({hits}/{len(bigrams)})")
     return missing
+
+
+def _content_bigrams(text: str) -> list[str]:
+    """论断的中文内容二元组（去停用 glue：问答套话不是证据）。"""
+    stop = {"根据", "研报", "内容", "检索", "资料", "显示", "所示", "如下"}
+    out: list[str] = []
+    for run in re.findall(r"[一-龥]{2,}", text):
+        if len(run) == 2:
+            if run not in stop:
+                out.append(run)
+        else:
+            out.extend(run[i : i + 2] for i in range(len(run) - 1))
+    return [g for g in out if g not in stop]

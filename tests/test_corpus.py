@@ -4,6 +4,8 @@
 D6 的"答案正确性"判定就是空中楼阁。每条事实的 evidence_terms
 必须能在对应研报文本里找到。
 """
+import re
+
 from app.rag.corpus import all_facts, build_corpus
 
 
@@ -35,3 +37,24 @@ def test_行业覆盖与source唯一():
     reports = build_corpus(n_reports=15, seed=3)
     assert len({r.source for r in reports}) == 15
     assert len({r.industry for r in reports}) >= 3
+
+def test_同一公司不重复出报告():
+    """数据合法性：同名多篇会让事实问题有多个答案，ground truth 歧义。
+
+    实测教训：30 篇语料里春山乳业出现 3 次（不同数字），
+    "春山乳业营业收入是多少"有 3 个答案，评测 6 个 miss 全源于此。
+    """
+    reports = build_corpus(n_reports=30, seed=42)
+    companies = [r.title.split("2025")[0] for r in reports]
+    assert len(companies) == len(set(companies)), (
+        f"公司重复: {[c for c in companies if companies.count(c) > 1]}"
+    )
+
+
+def test_事实答案数字能在语料文本中找到():
+    """ground truth 可回溯：标准答案里的数字必须出现在报告正文里。"""
+    reports = build_corpus(n_reports=5, seed=7)
+    for f in all_facts(reports):
+        src = next(r for r in reports if r.source == f.source)
+        for num in re.findall(r"\d+(?:\.\d+)?", f.answer):
+            assert num in src.text, f"{f.fact_id} 的数字 {num} 不在语料中"
