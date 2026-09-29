@@ -1,0 +1,25 @@
+# FinRAG 基础设施：独立 postgres（pgvector）。
+# 与 DataCrew 零共享：端口 5433（DataCrew 用 5432）、独立数据卷、
+# 独立容器名。两个项目任何一侧重建/挂掉都不影响另一侧。
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: finrag-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: finrag
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d finrag"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:

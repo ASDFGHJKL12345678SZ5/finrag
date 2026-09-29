@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finrag"
+version = "0.1.0"
+description = "金融研报知识库问答：结构感知 RAG + 引用校验 + 评测闭环"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "asyncpg>=0.29",              # pgvector 检索（异步连接池）
+    "pgvector>=0.3",              # Python 侧向量类型支持
+    "numpy>=1.26",                # 向量运算（归一化/相似度）
+    "fastembed>=0.3",             # 本地 ONNX embedding（bge-small-zh-v1.5）
+    "httpx>=0.27",
+    "tenacity>=8.2",              # 重试
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*", "eval*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "module"
+testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"eval/*" = ["E501"]
