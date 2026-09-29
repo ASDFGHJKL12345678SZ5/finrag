@@ -37,11 +37,23 @@ class Settings(BaseSettings):
     chunk_overlap_chars: int = 60  # 相邻块重叠，缓解边界切断
 
     # ---- 检索 ----
-    retrieve_top_k: int = 8        # 向量召回条数
+    retrieve_top_k: int = 8
+    # 融合权重：向量路管语义相关，关键词路管实体精确。初始 6:4，
+    # D6 评测数据说话后调（mock 模式向量是噪声，自动降为 0——见 retrieve.py）
+    vector_weight: float = 0.6
+    keyword_weight: float = 0.4        # 向量召回条数
     retrieve_keyword_k: int = 4    # 关键词召回条数（并集去重后重排）
 
     # ---- 引用校验（D5）----
     min_citation_overlap: float = 0.6  # 论断与引用 chunk 的最低重合度
+
+    # ---- LLM ----
+    # mock：规则假模型（CI/无 key 可复现，含幻觉型威胁模拟）
+    # real：OpenAI 兼容协议，DeepSeek/Qwen 换 base_url + key 即切
+    llm_mode: str = "mock"
+    llm_base_url: str = "https://api.deepseek.com"
+    llm_api_key: str = ""
+    llm_model: str = "deepseek-chat"
 
 
 @lru_cache

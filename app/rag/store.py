@@ -173,8 +173,11 @@ async def keyword_search(query: str, top_k: int, industry: str | None = None) ->
     if not terms:
         return []
     n = len(terms)
+    # 按词长加权：命中"宁德润能"（4 字）比命中"年的"（2 字）更能说明
+    # 文档相关——不用真 IDF（要全表统计），词长是零成本的近似
     hit_clause = " + ".join(
-        "(text ILIKE '%'||$" + str(i + 2) + "||'%')::int" for i in range(n)
+        "(text ILIKE '%'||$" + str(i + 2) + "||'%')::int * length($" + str(i + 2) + ")"
+        for i in range(n)
     )
     where_clause = " OR ".join(
         "text ILIKE '%'||$" + str(i + 2) + "||'%'" for i in range(n)
@@ -197,8 +200,28 @@ async def keyword_search(query: str, top_k: int, industry: str | None = None) ->
 
 
 def _extract_terms(query: str) -> list[str]:
-    """从查询里提取实义片段：连续中文/字母数字串（2 字以上）。
+    """从查询里提取检索用词。
 
-    金融查询的关键实体（"宁德时代""ROE""300750"）都是连续串，简单切分即有效。
+    中文没有空格，整句是一个连续串——直接拿去做 ILIKE 永远匹配不上。
+    策略：连续中文串按二元组切（"宁德润能" -> 宁德/德润/润能），
+    英文数字串原样保留（ROE、300750 是完整实体，切开就丢了）。
+    二元组与 pg_trgm 索引配合，召回靠部分命中计数打分。
     """
-    return [m for m in re.findall(r"[一-龥A-Za-z0-9]+", query) if len(m) >= 2]
+    terms: list[str] = []
+    for run in re.findall(r"[一-龥]+|[A-Za-z0-9]+", query):
+        if re.fullmatch(r"[A-Za-z0-9]+", run):
+            if len(run) >= 2:
+                terms.append(run)
+            continue
+        if len(run) <= 8:
+            # 整串 + 二元组：完整实体（公司名/指标名）区分度最高，
+            # 二元组保证部分命中仍有召回
+            terms.append(run)
+            if len(run) >= 2:
+                terms.extend(run[i : i + 2] for i in range(len(run) - 1))
+        else:
+            terms.extend(run[i : i + 2] for i in range(len(run) - 1))
+    seen: dict[str, None] = {}
+    for t in terms:
+        seen.setdefault(t, None)
+    return list(seen)[:12]

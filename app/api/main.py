@@ -1,29 +1,150 @@
-"""FastAPI 应用骨架（D4：仅健康检查；入库走 CLI，问答图 D5 接入）。"""
+"""FinRAG API：健康检查 + 问答（SSE 流式 / 同步两种形态）。
+
+SSE 事件契约（扁平 dict，无 data 包装——与 DataCrew 保持一致）：
+    {"event": "node",    "node": "retrieve", "latency_ms": 12.3, "detail": {...}}
+    {"event": "status",  "status": "done", "retry_count": 1}
+    {"event": "answer",  "answer": "...", "citations": [...], "total_ms": 90.2}
+    {"event": "refuse",  "reason": "...", "verdicts": [...]}     # 证据不足拒答
+    {"event": "error",   "detail": "..."}
+
+为什么流式：问答链路 3-6 个节点、每节点几十到几百毫秒，流式让用户
+第一时间看到"在检索/在生成"，而不是对着转圈等 2 秒。评测脚本用同步
+接口（/ask/sync），前端/DEMO 用 SSE。
+"""
+from __future__ import annotations
+
+import json
+import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
-from app.core.config import get_settings
-from app.core.logging import get_logger, setup_logging
+from app.core.logging import get_logger
+from app.core.winloop import ensure_selector_loop
 from app.rag import store
+from app.rag.graph import ask, build_rag_graph
 
 log = get_logger("api")
 
+ensure_selector_loop()
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    setup_logging(get_settings().log_level)
+app = FastAPI(title="FinRAG", version="0.5.0", description="金融研报知识库问答")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=2, max_length=500)
+    session_id: str = "default"
+
+
+@app.on_event("startup")
+async def _startup() -> None:
     await store.init_store()
-    log.info("api.started")
-    yield
+    log.info("api.startup", extra={"context": {"store": "ready"}})
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
     await store.close_store()
-    log.info("api.stopped")
-
-
-app = FastAPI(title="FinRAG API", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok", "service": "finrag"}
+
+
+@app.post("/ask/sync")
+async def ask_sync(req: AskRequest) -> dict:
+    """同步问答：跑完整状态机，返回终态（评测脚本用这个）。"""
+    started = time.perf_counter()
+    final = await ask(req.question, session_id=req.session_id)
+    total_ms = round((time.perf_counter() - started) * 1000, 1)
+    return {
+        "question": req.question,
+        "answer": final.get("answer", ""),
+        "status": final.get("status", "failed"),
+        "citations": _citations(final),
+        "verdicts": final.get("verdicts") or [],
+        "retry_count": final.get("retry_count", 0),
+        "trace": final.get("trace") or [],
+        "total_ms": total_ms,
+    }
+
+
+@app.post("/ask")
+async def ask_stream(req: AskRequest) -> StreamingResponse:
+    """SSE 流式问答：节点级事件 + 终态（answer 或 refuse）。"""
+
+    async def gen() -> AsyncIterator[str]:
+        started = time.perf_counter()
+        try:
+            graph = build_rag_graph()
+            # stream_mode="updates"：每完成一个节点推一次该节点的状态增量
+            async for chunk in graph.astream(
+                {
+                    "question": req.question,
+                    "session_id": req.session_id,
+                    "status": "running",
+                    "retry_count": 0,
+                },
+                stream_mode="updates",
+            ):
+                for node, delta in chunk.items():
+                    for step in delta.get("trace") or []:
+                        yield _sse({"event": "node", "node": node, **step})
+                    if "status" in delta:
+                        yield _sse({
+                            "event": "status",
+                            "status": delta["status"],
+                            "retry_count": delta.get("retry_count", 0),
+                        })
+                    if "answer" in delta:
+                        yield _sse({"event": "answer", "answer": delta["answer"]})
+            # 终态拿全量（astream 只给增量，citations 要全量）
+            final = await ask(req.question, session_id=req.session_id)
+            total_ms = round((time.perf_counter() - started) * 1000, 1)
+            if final.get("status") == "done":
+                yield _sse({
+                    "event": "answer",
+                    "answer": final.get("answer", ""),
+                    "citations": _citations(final),
+                    "total_ms": total_ms,
+                })
+            else:
+                yield _sse({
+                    "event": "refuse",
+                    "reason": "证据不足或引用校验未通过",
+                    "verdicts": final.get("verdicts") or [],
+                    "answer": final.get("answer", ""),
+                    "total_ms": total_ms,
+                })
+        except Exception as exc:
+            log.exception("api.ask_failed")
+            yield _sse({"event": "error", "detail": str(exc)})
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+def _citations(final: dict) -> list[dict]:
+    return [
+        {
+            "citation_id": c["citation_id"],
+            "source": c["source"],
+            "section_path": c.get("section_path", ""),
+            "text": c["text"],
+            "score": round(c["score"], 4),
+        }
+        for c in (final.get("retrieved") or [])
+    ]
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}" + chr(10) + chr(10)

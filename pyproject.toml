@@ -18,6 +18,8 @@ dependencies = [
     "fastembed>=0.3",             # 本地 ONNX embedding（bge-small-zh-v1.5）
     "httpx>=0.27",
     "tenacity>=8.2",              # 重试
+    "langgraph>=0.2",             # 问答状态机编排
+    "openai>=1.40",               # DeepSeek/Qwen 均 OpenAI 兼容
 ]
 
 [project.optional-dependencies]
