@@ -40,6 +40,24 @@
 → embedder 向量化 → pgvector 入库。问答时查询向量与关键词双路召回、
 并集重排，生成阶段强制引用 chunk，引用校验不过则拒答。
 
+问答状态机图（节点名与 app/rag/graph.py 一致）：
+
+```mermaid
+stateDiagram-v2
+    [*] --> understand_query
+    understand_query --> retrieve
+    retrieve --> generate
+    generate --> verify
+    verify --> [*] : 校验通过：带引用答案
+    verify --> rewrite_query : 校验不过且 retry 小于 2
+    rewrite_query --> retrieve
+    verify --> [*] : 校验不过且 retry 已达上限：拒答
+```
+
+重试环的设计：改写查询时只把 verdict 里的真实缺失证据词（数字/中文实词）
+拼回问题——状态词（如无对应引用）拼进去会污染下一轮检索。
+拒答是正常终态：宁可说没有依据，也不放行无引用或引用对不上的数字论断。
+
 ## 2. 目录结构
 
 ```
