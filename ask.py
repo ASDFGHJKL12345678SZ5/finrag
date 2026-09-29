@@ -29,7 +29,7 @@ def ask(question: str) -> dict:
     return r.json()
 
 
-def show(d: dict) -> None:
+def show(d: dict, trace: bool = False) -> None:
     status = d.get("status")
     # 不用 emoji：Windows cmd 默认 GBK 代码页，emoji 会变问号
     mark = "[通过]" if status == "done" else "[拒答]"
@@ -45,6 +45,10 @@ def show(d: dict) -> None:
                 continue
             seen.add(key)
             print(f"  [{c['citation_id']}] {c['source']}  ({c.get('section_path') or '-'})")
+            if trace:
+                # 溯源模式：打印被引 chunk 全文——答案里每个数字都能在这里找到，
+                # 这是用户自查答案正确性的依据（语料是合成的，现实无法验证）
+                print(f"      原文: {c.get('text', '')}")
     verdicts = d.get("verdicts") or []
     bad = [v for v in verdicts if not v.get("supported")]
     if bad:
@@ -55,12 +59,15 @@ def show(d: dict) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) > 1:
-        show(ask(" ".join(sys.argv[1:])))
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    trace = "--trace" in sys.argv
+    if args:
+        show(ask(" ".join(args)), trace=trace)
         return
     print("FinRAG 问答客户端（直接回车退出）")
     print("试试: 青蓝动力2025年的归母净利润是多少？")
     print("     预测一下宁德润能未来三年的股价目标   <- 这句会被拒答")
+    print("    --trace 参数：同时打印被引 chunk 全文，可逐字核对答案里的数字")
     while True:
         try:
             q = input(chr(10) + "问: ").strip()
@@ -70,7 +77,7 @@ def main() -> None:
         if not q:
             break
         try:
-            show(ask(q))
+            show(ask(q), trace=trace)
         except httpx.HTError as e:
             print(f"连不上 API（{e}）——先另开窗口跑: .venv/Scripts/python.exe -m app.main")
 
