@@ -1,0 +1,57 @@
+# CI：lint + 全量测试（pgvector 服务，无需 API Key / 无需下载模型）
+#
+# 设计说明：
+# - 用 pgvector 官方镜像，init SQL 与本地 docker compose 同一份
+# - EMBEDDING_MODE=mock / LLM_MODE=mock：哈希向量 + 规则假模型，
+#   测试不下载 embedding 模型（CI 无外网也稳），链路与真实模式同构
+# - 集成测试自己 TRUNCATE + 自灌数据，不依赖执行顺序
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: finrag
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -e ".[dev]"
+
+      - name: 初始化数据库（扩展 + schema）
+        env:
+          PG_DSN: postgresql://postgres:postgres@localhost:5432/finrag
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d finrag -f deploy/postgres/init/01_extensions.sql
+          python -c "from app.rag.store import init_store; import asyncio; asyncio.run(init_store())"
+
+      - name: ruff
+        run: ruff check app tests scripts
+
+      - name: pytest
+        env:
+          EMBEDDING_MODE: mock
+          LLM_MODE: mock
+          # CI 的 postgres 服务在 5432（本地开发容器是 5433）
+          PG_DSN: postgresql://postgres:postgres@localhost:5432/finrag
+        run: python -m pytest tests/ -q
