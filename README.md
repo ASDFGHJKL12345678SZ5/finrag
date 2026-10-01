@@ -141,6 +141,31 @@ answer_accuracy 63.3% 到 100% 的修复过程（评测驱动，每个数字可�
 6. 语料数据合法性：同一公司出多篇不同数字的报告 -> 事实问题有多个答案
    （ground truth 歧义）-> 一篇一公司 + 唯一性不变量测试
 
+
+### 真实模型标定（2026-10-01，EMBEDDING_MODE=local + LLM_MODE=real）
+
+同一评测脚本、同一语料种子（30 篇 / 90 事实 / seed=42），只换真实组件：
+embedding 用 fastembed 本地 ONNX（BAAI/bge-small-zh-v1.5，512 维），LLM 用 DeepSeek。
+
+| 指标 | mock 模式 | 真实模式 | 解读 |
+|---|---|---|---|
+| retrieval_hit@5（vector_only） | 15.6%（随机基线） | **100%** | 真实语义检索从随机基线到全中 |
+| retrieval_hit@5（hybrid） | 100% | **100%** | 两路互补，真实模式下不退步 |
+| answer_accuracy | 100% | **100%（90/90）** | 标准答案数字出现在真实模型生成答案中 |
+| citation_faithfulness | 100% | **100%** | 数字论断仍被引用证据支持 |
+| refusal_accuracy | 100% | **0%（0/10）** | **见下方诚实边界——真实接入最重要的发现** |
+| 延迟 P50 / P95 | 13ms / 14.5ms | **834ms / 1240ms** | 真实 LLM 网络往返，量级差 60-80 倍 |
+
+**诚实边界（真实模式）**：
+1. refusal_accuracy 从 mock 的 100% 掉到 **0%**——mock 的"全拒答"是规则假模型的产物
+   （预测类问题它只会输出空），不是系统的拒答能力。真实 DeepSeek 会把
+   "预测未来三年营收"流畅地编出来。当前判据是"检索无证据 → insufficient"，
+   但强检索下幻觉问题也能捞到相关文档 → 有据可依的胡说，验证节点拦不住。
+   **这是接入真实模型后暴露的真缺口**，后续方向：答案里的数字必须出现在检索证据中
+   （citation_faithfulness 已有雏形，但幻觉问题没有"标准数字"可比）。
+2. answer_accuracy 1.0 有小语料红利（30 篇、90 事实、数字唯一），大规模语料需重测。
+3. 评测落库 eval.runs（mode 字段区分 mock/local），`python -m app.eval.runner` 可复现。
+
 诚实边界：以上数字全部是 mock 模式（哈希向量 + 规则假模型）。
 vector_only 的 15.6% 是随机基线，不代表真实 embedding 的能力；真实
 embedding / 真实 LLM 接入后必须重新标定——评测脚本、语料种子、
