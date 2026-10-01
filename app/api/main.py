@@ -85,18 +85,28 @@ async def ask_stream(req: AskRequest) -> StreamingResponse:
 
     async def gen() -> AsyncIterator[str]:
         started = time.perf_counter()
+        final: dict = {}
         try:
             graph = build_rag_graph()
-            # stream_mode="updates"：每完成一个节点推一次该节点的状态增量
-            async for chunk in graph.astream(
+            # stream_mode=["updates","values"]：一次跑完同时拿两种数据——
+            #   updates：每节点增量（node/status/answer 事件从这里推）
+            #   values ：每节点后的全量快照（最后一个就是终态，citations 要全量）
+            # 曾经 astream(updates) 之后又 await ask() 重跑一遍完整图：
+            # 一次 SSE 请求触发两轮 LLM 调用（成本翻倍、延迟翻倍），且
+            # /ask 与 /ask/sync 并发时 checkpointer 两路写可能把"未初始化"
+            # 的旧状态读回来——修复见 README ADR（D7）。
+            async for mode, chunk in graph.astream(
                 {
                     "question": req.question,
                     "session_id": req.session_id,
                     "status": "running",
                     "retry_count": 0,
                 },
-                stream_mode="updates",
+                stream_mode=["updates", "values"],
             ):
+                if mode == "values":
+                    final = chunk
+                    continue
                 for node, delta in chunk.items():
                     for step in delta.get("trace") or []:
                         yield _sse({"event": "node", "node": node, **step})
@@ -108,8 +118,6 @@ async def ask_stream(req: AskRequest) -> StreamingResponse:
                         })
                     if "answer" in delta:
                         yield _sse({"event": "answer", "answer": delta["answer"]})
-            # 终态拿全量（astream 只给增量，citations 要全量）
-            final = await ask(req.question, session_id=req.session_id)
             total_ms = round((time.perf_counter() - started) * 1000, 1)
             if final.get("status") == "done":
                 yield _sse({

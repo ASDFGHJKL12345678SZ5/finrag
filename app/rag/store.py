@@ -51,9 +51,14 @@ CREATE TABLE IF NOT EXISTS rag.chunks (
     UNIQUE (source, chunk_index)
 );
 
--- HNSW 向量索引（内积距离；向量已归一化，内积 == 余弦）
-CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw
-    ON rag.chunks USING hnsw (embedding vector_ip_ops);
+-- HNSW 向量索引：算子类必须和查询运算符一致！查询用 <=>（余弦距离），
+-- 索引就得是 vector_cosine_ops——曾经用 vector_ip_ops，计划器直接用不上
+-- 索引，万行 chunks 全表扫描（EXPLAIN 可见 Seq Scan）。向量已 L2 归一化，
+-- 余弦/内积数值等价，但 pgvector 要求算子类与运算符一一对应。
+-- DROP+CREATE（而非 IF NOT EXISTS）保证旧库升级时纠正算子类，且保持幂等。
+DROP INDEX IF EXISTS rag.chunks_embedding_hnsw;
+CREATE INDEX chunks_embedding_hnsw
+    ON rag.chunks USING hnsw (embedding vector_cosine_ops);
 -- trigram 索引：关键词召回走 ILIKE 路径（中文内置分词不可用，见 keyword_search）
 CREATE INDEX IF NOT EXISTS chunks_text_trgm
     ON rag.chunks USING gin (text gin_trgm_ops);

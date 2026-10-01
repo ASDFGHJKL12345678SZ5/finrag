@@ -41,8 +41,8 @@ class Settings(BaseSettings):
     # 融合权重：向量路管语义相关，关键词路管实体精确。初始 6:4，
     # D6 评测数据说话后调（mock 模式向量是噪声，自动降为 0——见 retrieve.py）
     vector_weight: float = 0.6
-    keyword_weight: float = 0.4        # 向量召回条数
-    retrieve_keyword_k: int = 4    # 关键词召回条数（并集去重后重排）
+    keyword_weight: float = 0.4        # 关键词路权重（向量 0.6 : 0.4）
+    retrieve_keyword_k: int = 4    # 关键词召回条数（并数去重后重排）
 
     # ---- 引用校验（D5）----
     min_citation_overlap: float = 0.6  # 论断与引用 chunk 的最低重合度

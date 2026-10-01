@@ -72,7 +72,7 @@ app/
   rag/ingest.py       入库流水线编排（CLI: python -m app.rag）
   api/main.py         FastAPI 骨架（D4：健康检查；D5：问答图接入）
 deploy/postgres/init/ 实例级扩展（vector + pg_trgm）
-tests/                18 个测试：分块不变量/向量契约/语料合法性/检索集成
+tests/                19 个测试：分块不变量/向量契约/语料合法性/检索集成/SSE 单跑回归
 ```
 
 ## 3. 设计决策日志（ADR）
@@ -110,7 +110,7 @@ tests/                18 个测试：分块不变量/向量契约/语料合法�
 |---|---|---|
 | D4 | 仓库骨架 + 分块/向量/检索/入库 + 合成语料 + 18 测试 | ✅ |
 | D5 | LangGraph 问答图：查询理解/混合检索/重排/带引用生成 + SSE API + 33 测试 | ✅ |
-| D6 | 评测闭环（35 测试）+ 压测 | ✅ |
+| D6 | 评测闭环（36 测试）+ 压测 | ✅ |
 | D7 | 与 DataCrew 一起收尾（CI/架构图/简历数字核验） | 待办 |
 
 ## 4.5 评测结果（D6，可复现）
@@ -177,3 +177,5 @@ LocalEmbedder 会自检维度，不匹配直接报错，不会静默建错列。
 | 人机交互 | 澄清口径 + 大表审批 | 证据不足拒答 + 引用溯源 |
 | 评测重点 | 执行类结果哈希 + 行为类拦截 | 检索命中率 + 引用忠实度 + 答案正确性 |
 | 数据库 | postgres 5432（含 pgvector 备用） | postgres 5433（pgvector 主力） |
+- **ADR-07 SSE 用 stream_mode=["updates","values"] 一次跑完，绝不 astream 后重跑**：初版 /ask 先 astream("updates") 推节点事件，终态再 await ask() 把完整图**重跑一遍**——一次 SSE 请求两轮 LLM 调用（成本/延迟双倍），且 /ask 与 /ask/sync 并发时 checkpointer 两路写可能把"未初始化"的旧状态读回来。修复后一次 astream 同时拿节点增量（推事件）和全量快照（最后一个即终态）。回归测试 tests/test_sse_single_run.py 把旧入口 ask 换成"一调用就炸"的探针，双跑复发立刻红。
+- **ADR-08 HNSW 索引算子类必须与查询运算符一一对应**：查询用 `<=>`（余弦距离），索引就必须是 vector_cosine_ops。曾经索引建成 vector_ip_ops——向量已 L2 归一化时两者数值等价，但 pgvector 的算子类与运算符是绑定关系，计划器直接用不上该索引，万行 chunks 全表扫描。D7 实测（150 行演示库，SET enable_seqscan=off 强制索引）：cosine 索引 → Index Scan，ip 索引 → Seq Scan。小表时规划器自己也会选 Seq Scan，这个 fix 的价值在数据量上来之后。
