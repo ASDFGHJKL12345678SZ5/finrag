@@ -51,14 +51,15 @@ CREATE TABLE IF NOT EXISTS rag.chunks (
     UNIQUE (source, chunk_index)
 );
 
--- HNSW 向量索引：算子类必须和查询运算符一致！查询用 <=>（余弦距离），
--- 索引就得是 vector_cosine_ops——曾经用 vector_ip_ops，计划器直接用不上
--- 索引，万行 chunks 全表扫描（EXPLAIN 可见 Seq Scan）。向量已 L2 归一化，
--- 余弦/内积数值等价，但 pgvector 要求算子类与运算符一一对应。
--- DROP+CREATE（而非 IF NOT EXISTS）保证旧库升级时纠正算子类，且保持幂等。
-DROP INDEX IF EXISTS rag.chunks_embedding_hnsw;
-CREATE INDEX chunks_embedding_hnsw
-    ON rag.chunks USING hnsw (embedding vector_cosine_ops);
+-- HNSW 向量索引不在 SCHEMA_SQL 里建：算子类必须和查询运算符一致（查询用 <=>
+-- 余弦距离，索引就得是 vector_cosine_ops（ADR-08）。曾经用 vector_ip_ops，
+-- 计划器直接用不上索引，万行 chunks 全表扫描（EXPLAIN 可见 Seq Scan）。向量已
+-- L2 归一化，余弦/内积数值等价，但 pgvector 要求算子类与运算符一一对应。
+-- 索引由 init_store() 里的 _ensure_hnsw_opclass() 建：只在缺失或算子类不
+-- 对（旧库升级路径）时才 DDL——早期版每次 init_store 都 DROP+CREATE，万行
+-- 级 chunks 的 HNSW 重建是分钟级阻塞，API/测试每起一次就付一次。
+-- （另：DO $$  dollar-quoting 曾在本文件被写成单 $，直接 PostgresSyntaxError，
+--   条件逻辑放 Python 后这类问题也顺带消除。）
 -- trigram 索引：关键词召回走 ILIKE 路径（中文内置分词不可用，见 keyword_search）
 CREATE INDEX IF NOT EXISTS chunks_text_trgm
     ON rag.chunks USING gin (text gin_trgm_ops);
@@ -66,6 +67,30 @@ CREATE INDEX IF NOT EXISTS chunks_text_trgm
 
 _pool: asyncpg.Pool | None = None
 
+
+async def _ensure_hnsw_opclass(conn) -> None:
+    """确保 HNSW 索引存在且算子类与查询运算符匹配（ADR-08，Python 侧条件执行）。"""
+    row = await conn.fetchrow(
+        """
+        SELECT op.opcname AS opclass
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_class t ON t.oid = i.indrelid
+        JOIN pg_opclass op ON op.oid = i.indclass[1]
+        WHERE t.relnamespace = 'rag'::regnamespace
+          AND t.relname = 'chunks'
+          AND c.relname = 'chunks_embedding_hnsw'
+        """
+    )
+    if row and row["opclass"] == "vector_cosine_ops":
+        return  # 索引已正确：热路径零 DDL
+    if row:
+        log.warning("store.hnsw_opclass_mismatch", extra={"context": {"found": row["opclass"]}})
+        await conn.execute("DROP INDEX IF EXISTS rag.chunks_embedding_hnsw")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw "
+        "ON rag.chunks USING hnsw (embedding vector_cosine_ops)"
+    )
 
 async def init_store() -> asyncpg.Pool:
     """建 schema（幂等）并返回连接池。"""
@@ -79,6 +104,29 @@ async def init_store() -> asyncpg.Pool:
         # 用字面替换而不是 .format()：SQL 里有 JSONB 默认值的花括号，
         # format 会把它们当占位符直接炸（IndexError）
         await conn.execute(SCHEMA_SQL.replace("{dim}", str(settings.embedding_dim)))
+        # HNSW 索引条件建/纠（在连接内：需要 conn；逻辑见 _ensure_hnsw_opclass）
+        await _ensure_hnsw_opclass(conn)
+        # 列宽自检（最终审查修复）：CREATE TABLE IF NOT EXISTS 不会给旧库改列宽，
+        # 换 embedding_dim 后旧 chunks 表还是老宽度，第一次 INSERT 才被 pgvector
+        # 用一句 expected 256 dimensions, not 512 打脸。这里启动时就给干净报错。
+        col = await conn.fetchval(
+            "SELECT format_type(a.atttypid, a.atttypmod) "
+            "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            + "WHERE n.nspname = 'rag' AND c.relname = 'chunks' "
+            + "AND a.attname = 'embedding'"
+        )
+        if col:
+            m = re.search(r"vector.(\d+).", col)
+            if m and int(m.group(1)) != settings.embedding_dim:
+                db_dim = int(m.group(1))
+                raise ValueError(
+                    "rag.chunks.embedding 列宽 " + str(db_dim)
+                    + " 与配置 embedding_dim=" + str(settings.embedding_dim)
+                    + " 不一致：换模型/改维度需要先迁移旧列（ALTER TABLE rag.chunks "
+                    + "ALTER COLUMN embedding TYPE vector(" + str(settings.embedding_dim)
+                    + ") 并重建 HNSW 索引），否则要到第一次 INSERT 才报错"
+                )
     log.info("store.ready", extra={"context": {"dim": settings.embedding_dim}})
     return _pool
 

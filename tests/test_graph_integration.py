@@ -43,6 +43,41 @@ def _run(body):
     return asyncio.run(wrapper())
 
 
+def test_rewrite_query_保留原始问题实体():
+    """改写查询必须依托 original_question（最终审查回归）。
+
+    早期版 rewrite_query 取 question.split(" ")[0]——中文问题没有空格，
+    "宁德润能2025年的营业收入是多少？"被截成"宁德润能2025年的营业收入是多少？"的
+    第一个"词"整段错乱，二轮检索直接偏到无关文档。现在依托 original_question
+    重建，此测试锁死该行为：改写后的问题必须仍含公司实体词。
+    """
+    from app.rag.graph import rewrite_query
+
+    state = {
+        "question": "宁德润能2025年的营业收入是多少？",
+        "original_question": "宁德润能2025年的营业收入是多少？",
+        "retry_count": 1,
+    }
+    out = rewrite_query(state)
+    q = out["question"]
+    assert "宁德润能" in q, f"改写后丢了公司实体: {q}"
+    assert len(q) >= 8, f"改写把问题截断了: {q}"
+
+
+def test_空检索时verify判insufficient而不是崩溃():
+    """检索为空 -> verify 守卫直接判 insufficient（最终审查修复）。
+
+    早期版空检索会让 generate 拿到空上下文、LLM 输出空答案，verify 再对
+    None 取下标直接 KeyError——一条正常链路（问了个语料外的问题）把整个
+    SSE 连接打成 500。守卫回归测试：无 chunk 进入 verify 必须落
+    insufficient，不得抛异常。
+    """
+    from app.rag.graph import verify
+
+    out = asyncio.run(verify({"question": "语料外的问题", "retrieved": []}))
+    assert out["status"] == "insufficient"
+    assert out["refusal_reason"] == "retrieval_empty"
+
 async def _reset_and_seed(n: int, seed: int):
     pool = store.get_pool()
     async with pool.acquire() as conn:

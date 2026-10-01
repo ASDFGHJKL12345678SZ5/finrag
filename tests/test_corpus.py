@@ -6,6 +6,8 @@ D6 的"答案正确性"判定就是空中楼阁。每条事实的 evidence_terms
 """
 import re
 
+import pytest
+
 from app.rag.corpus import all_facts, build_corpus
 
 
@@ -58,3 +60,25 @@ def test_事实答案数字能在语料文本中找到():
         src = next(r for r in reports if r.source == f.source)
         for num in re.findall(r"\d+(?:\.\d+)?", f.answer):
             assert num in src.text, f"{f.fact_id} 的数字 {num} 不在语料中"
+
+def test_fact_registry与all_facts同源():
+    """FactRegistry（最终审查落地）与 all_facts 必须完全一致。"""
+    from app.rag.corpus import all_facts, build_corpus, build_registry
+
+    reports = build_corpus()
+    reg = build_registry(reports)
+    assert len(reg) == len(all_facts(reports)) == 90
+    by_id = {f.fact_id: f for f in all_facts(reports)}
+    for q, fact in reg.questions():
+        assert by_id[fact.fact_id] is fact
+
+
+def test_fact_registry拒绝重复登记():
+    """fact_id 重复是语料生成 bug——登记表必须在入口处炸出来。"""
+    from app.rag.corpus import Fact, FactRegistry
+
+    reg = FactRegistry()
+    fact = Fact(fact_id="f1", source="s", question="q", answer="a", evidence_terms=[])
+    reg.register(fact)
+    with pytest.raises(ValueError, match="重复登记"):
+        reg.register(fact)

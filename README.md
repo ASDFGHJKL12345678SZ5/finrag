@@ -62,17 +62,26 @@ stateDiagram-v2
 
 ```
 app/
+  main.py             uvicorn 入口：python -m app.main（端口 8001）
+  loops.py            Windows Selector 事件循环（asyncpg 兼容）
   core/config.py      配置（env 驱动，dim 启动自检）
   core/logging.py     结构化 JSON 日志
-  core/winloop.py     Windows Selector 循环（asyncpg 兼容）
   rag/chunker.py      结构感知分块器（章节路径/表格保全/滑动窗口）
   rag/embeddings.py   Embedder 协议：本地 ONNX + 确定性 mock
   rag/store.py        pgvector：schema/写入/向量召回/关键词召回
+  rag/retrieve.py     混合检索（向量+关键词 IDF 加权）
+  rag/graph.py        LangGraph 问答图：理解/检索/重写/生成/校验
+  rag/llm.py          DeepSeek 客户端（tenacity 重试 + 进程级单例）
+  rag/verify.py       引用校验：数字论断词面回溯（拒答机制）
   rag/corpus.py       合成研报语料 + FactRegistry（ground truth 同源）
   rag/ingest.py       入库流水线编排（CLI: python -m app.rag）
-  api/main.py         FastAPI 骨架（D4：健康检查；D5：问答图接入）
+  api/main.py         FastAPI：/ask SSE 问答 + /health
+  eval/runner.py      评测 driver：检索命中/拒答/引用/答案正确率
+  eval/schema.py      评测指标定义
+ask.py                CLI 问一句并打印答案+引用
+scripts/load_test.py 压测（含 SOCKS 代理选项）
 deploy/postgres/init/ 实例级扩展（vector + pg_trgm）
-tests/                19 个测试：分块不变量/向量契约/语料合法性/检索集成/SSE 单跑回归
+tests/                36 个测试：分块不变量/向量契约/语料合法性/检索集成/校验器/SSE 单跑回归
 ```
 
 ## 3. 设计决策日志（ADR）
@@ -101,6 +110,9 @@ tests/                19 个测试：分块不变量/向量契约/语料合法�
   评测时逐条可回溯——"答案对不对"有确定来源，不依赖人工标注。固定
   随机种子，语料逐字节可复现。
 - **ADR-06 端口 5433、独立数据卷**：与 DataCrew 物理隔离，任何一侧
+- **ADR-07 SSE 用 stream_mode=["updates","values"] 一次跑完，绝不 astream 后重跑**：初版 /ask 先 astream("updates") 推节点事件，终态再 await ask() 把完整图**重跑一遍**——一次 SSE 请求两轮 LLM 调用（成本/延迟双倍），且 /ask 与 /ask/sync 并发时 checkpointer 两路写可能把"未初始化"的旧状态读回来。修复后一次 astream 同时拿节点增量（推事件）和全量快照（最后一个即终态）。回归测试 tests/test_sse_single_run.py 把旧入口 ask 换成"一调用就炸"的探针，双跑复发立刻红。
+- **ADR-08 HNSW 索引算子类必须与查询运算符一一对应**：查询用 `<=>`（余弦距离），索引就必须是 vector_cosine_ops。曾经索引建成 vector_ip_ops——向量已 L2 归一化时两者数值等价，但 pgvector 的算子类与运算符是绑定关系，计划器直接用不上该索引，万行 chunks 全表扫描。D7 实测（150 行演示库，SET enable_seqscan=off 强制索引）：cosine 索引 → Index Scan，ip 索引 → Seq Scan。小表时规划器自己也会选 Seq Scan，这个 fix 的价值在数据量上来之后。
+- **ADR-09 引用校验是结构性的词面校验，不是语义相似**：金融场景幻觉零容忍，但"让 LLM 自己保证不编"不可靠。校验器抽取答案中每个含数字的论断，要求其数字与关键词**词面出现**在它引用的 chunk 文本里；任一论断无依据 -> 整篇降级为"资料不足"拒答。语义相似要再上一个模型，而词面校验对"编数字"这类最高危幻觉已足够（编的数字几乎不可能恰好出现在语料里），且确定、可单测、零依赖。
   重建/挂掉不影响另一侧。两个项目的代码也零共享——差异化是刻意的，
   不是懒。
 
@@ -115,7 +127,10 @@ tests/                19 个测试：分块不变量/向量契约/语料合法�
 
 ## 4.5 评测结果（D6，可复现）
 
-跑法：EMBEDDING_MODE=mock python -m app.eval.runner（30 篇 / 90 事实 / seed=42）。
+跑法（30 篇 / 90 事实 / seed=42；每次 run 落库 eval.runs，metrics + per_fact
+JSONB 可下钻）：
+    pwsh:     $env:EMBEDDING_MODE="mock"; python -m app.eval.runner
+    linux:    EMBEDDING_MODE=mock python -m app.eval.runner
 每次 run 落库 eval.runs（metrics + per_fact JSONB），数字可下钻复盘。
 
 | 指标 | 数值 | 说明 |
@@ -142,7 +157,7 @@ answer_accuracy 63.3% 到 100% 的修复过程（评测驱动，每个数字可�
    （ground truth 歧义）-> 一篇一公司 + 唯一性不变量测试
 
 
-### 真实模型标定（2026-10-01，EMBEDDING_MODE=local + LLM_MODE=real）
+### 真实模型标定（2026-10-01 复跑复现，EMBEDDING_MODE=local + LLM_MODE=real）
 
 同一评测脚本、同一语料种子（30 篇 / 90 事实 / seed=42），只换真实组件：
 embedding 用 fastembed 本地 ONNX（BAAI/bge-small-zh-v1.5，512 维），LLM 用 DeepSeek。
@@ -153,15 +168,19 @@ embedding 用 fastembed 本地 ONNX（BAAI/bge-small-zh-v1.5，512 维），LLM 
 | retrieval_hit@5（hybrid） | 100% | **100%** | 两路互补，真实模式下不退步 |
 | answer_accuracy | 100% | **100%（90/90）** | 标准答案数字出现在真实模型生成答案中 |
 | citation_faithfulness | 100% | **100%** | 数字论断仍被引用证据支持 |
-| refusal_accuracy | 100% | **0%（0/10）** | **见下方诚实边界——真实接入最重要的发现** |
-| 延迟 P50 / P95 | 13ms / 14.5ms | **834ms / 1240ms** | 真实 LLM 网络往返，量级差 60-80 倍 |
+| refusal_accuracy | 100% | **0.1（1/10）** | 重跑在 0-2/10 间波动——**见下方诚实边界，真实接入最重要的发现** |
+| 延迟 P50 / P95 | 12.2ms / 15.1ms | **650ms / 1003ms** | 真实 LLM 网络往返，量级差 50-70 倍 |
 
 **诚实边界（真实模式）**：
-1. refusal_accuracy 从 mock 的 100% 掉到 **0%**——mock 的"全拒答"是规则假模型的产物
-   （预测类问题它只会输出空），不是系统的拒答能力。真实 DeepSeek 会把
-   "预测未来三年营收"流畅地编出来。当前判据是"检索无证据 → insufficient"，
-   但强检索下幻觉问题也能捞到相关文档 → 有据可依的胡说，验证节点拦不住。
-   **这是接入真实模型后暴露的真缺口**，后续方向：答案里的数字必须出现在检索证据中
+1. refusal_accuracy 从 mock 的 100% 掉到 **0.1（1/10）**，多次重跑在 0-2/10 波动——先说判据：评测只把
+   `status=="insufficient"`（检索为空 ⇒ verify 节点判"资料不足"）记为拒答。
+   模型嘴上说"无法预测"（verbal refusal）但检索有证据时，校验器照的是"数字论断
+   有据即可通过"——定性回答本就无数字可卡，最终 status 是 `done` 而不是
+   `insufficient`，不计入拒答。mock 的 100% 是规则假模型的产物（预测类问题它
+   输出空/固定拒答话术，经空检索守卫稳定落到 insufficient），不代表系统能力。
+   真实 DeepSeek 会把"预测未来三年营收"流畅编出来，且强检索下幻觉问题也能
+   捞到相关文档 → 有据可依的胡说，verify 节点拦不住。**这是真实接入后暴露的
+   真缺口**，后续方向：对检索证据支持不足的定性回答增设"证据充分性"判据
    （citation_faithfulness 已有雏形，但幻觉问题没有"标准数字"可比）。
 2. answer_accuracy 1.0 有小语料红利（30 篇、90 事实、数字唯一），大规模语料需重测。
 3. 评测落库 eval.runs（mode 字段区分 mock/local），`python -m app.eval.runner` 可复现。
@@ -174,18 +193,35 @@ embedding / 真实 LLM 接入后必须重新标定——评测脚本、语料种
 ## 5. 本地运行
 
 ```bash
-# 1. 起数据库（独立 postgres，端口 5433）
+# ===== 以下 Windows 用 pwsh 语法；Linux/macOS 用 # 注释的同义行 =====
+
+# 1. 起数据库（独立 postgres，端口 5433，与 DataCrew 的 5432 物理隔离）
 docker compose up -d
 
 # 2. 装依赖（venv 已建则跳过）
-python -m venv .venv && .venv/Scripts/pip install -e ".[dev]"   # Windows
-# source .venv/bin/activate && pip install -e ".[dev]"           # Linux
+python -m venv .venv; .venv/Scripts/pip install -e ".[dev]"     # Windows(pwsh)
+# python -m venv .venv && .venv/bin/pip install -e ".[dev]"      # Linux/macOS
 
-# 3. 入库（mock 向量，不下载模型）
-EMBEDDING_MODE=mock python -m app.rag --reports 30
+# 3. 入库（mock 向量，不下载模型；首次真实 embedding 会自动下载 bge 模型）
+$env:EMBEDDING_MODE="mock"; python -m app.rag --reports 30     # Windows(pwsh)
+# EMBEDDING_MODE=mock python -m app.rag --reports 30            # Linux/macOS
 
 # 4. 测试
-EMBEDDING_MODE=mock python -m pytest tests/ -q
+$env:EMBEDDING_MODE="mock"; python -m pytest tests/ -q         # Windows(pwsh)
+# EMBEDDING_MODE=mock python -m pytest tests/ -q                # Linux/macOS
+
+# 5. 起 API（FastAPI，端口 8001；swagger: http://localhost:8001/docs）
+python -m app.main
+
+# 6. 命令行问一句（打印答案 + 引用 chunk）
+python ask.py "宁德润能2025年的营业收入是多少？"
+
+# 7. 评测（mock 模式全链路可过；真实标定见 §4.5）
+$env:EMBEDDING_MODE="mock"; python -m app.eval.runner           # Windows(pwsh)
+# EMBEDDING_MODE=mock python -m app.eval.runner                  # Linux/macOS
+
+# 8. 压测
+python scripts/load_test.py --help
 ```
 
 首次用真实模型（local 模式）会自动下载 bge-small-zh-v1.5（约 100MB），
@@ -202,5 +238,3 @@ LocalEmbedder 会自检维度，不匹配直接报错，不会静默建错列。
 | 人机交互 | 澄清口径 + 大表审批 | 证据不足拒答 + 引用溯源 |
 | 评测重点 | 执行类结果哈希 + 行为类拦截 | 检索命中率 + 引用忠实度 + 答案正确性 |
 | 数据库 | postgres 5432（含 pgvector 备用） | postgres 5433（pgvector 主力） |
-- **ADR-07 SSE 用 stream_mode=["updates","values"] 一次跑完，绝不 astream 后重跑**：初版 /ask 先 astream("updates") 推节点事件，终态再 await ask() 把完整图**重跑一遍**——一次 SSE 请求两轮 LLM 调用（成本/延迟双倍），且 /ask 与 /ask/sync 并发时 checkpointer 两路写可能把"未初始化"的旧状态读回来。修复后一次 astream 同时拿节点增量（推事件）和全量快照（最后一个即终态）。回归测试 tests/test_sse_single_run.py 把旧入口 ask 换成"一调用就炸"的探针，双跑复发立刻红。
-- **ADR-08 HNSW 索引算子类必须与查询运算符一一对应**：查询用 `<=>`（余弦距离），索引就必须是 vector_cosine_ops。曾经索引建成 vector_ip_ops——向量已 L2 归一化时两者数值等价，但 pgvector 的算子类与运算符是绑定关系，计划器直接用不上该索引，万行 chunks 全表扫描。D7 实测（150 行演示库，SET enable_seqscan=off 强制索引）：cosine 索引 → Index Scan，ip 索引 → Seq Scan。小表时规划器自己也会选 Seq Scan，这个 fix 的价值在数据量上来之后。

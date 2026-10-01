@@ -3,8 +3,9 @@
 SSE 事件契约（扁平 dict，无 data 包装——与 DataCrew 保持一致）：
     {"event": "node",    "node": "retrieve", "latency_ms": 12.3, "detail": {...}}
     {"event": "status",  "status": "done", "retry_count": 1}
-    {"event": "answer",  "answer": "...", "citations": [...], "total_ms": 90.2}
-    {"event": "refuse",  "reason": "...", "verdicts": [...]}     # 证据不足拒答
+    {"event": "answer",  "answer": "..."}                      # 生成节点的流式中继
+    {"event": "answer",  "answer": "...", "citations": [...], "total_ms": 90.2}  # 终态（带全字段）
+    {"event": "refuse",  "reason": "...", "verdicts": [...]}     # 证据不足拒答（终态）
     {"event": "error",   "detail": "..."}
 
 为什么流式：问答链路 3-6 个节点、每节点几十到几百毫秒，流式让用户
@@ -16,12 +17,14 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.winloop import ensure_selector_loop
 from app.rag import store
@@ -31,7 +34,28 @@ log = get_logger("api")
 
 ensure_selector_loop()
 
-app = FastAPI(title="FinRAG", version="0.5.0", description="金融研报知识库问答")
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """启动/关闭钩子（最终审查修复：@app.on_event 在 FastAPI 0.10x 已废弃，
+    lifespan 是官方替代；本地 embedding 模式在启动时预热，首问不付下载/初始化）"""
+    await store.init_store()
+    if get_settings().embedding_mode == "local":
+        # 本地 ONNX 模型首次加载约数秒——放启动处，首问不背这个延迟
+        from app.rag.embeddings import get_embedder
+
+        get_embedder()
+        log.info("api.embedder_warm")
+    log.info("api.startup", extra={"context": {"store": "ready"}})
+    yield
+    await store.close_store()
+
+
+app = FastAPI(
+    title="FinRAG",
+    version="0.5.0",
+    description="金融研报知识库问答",
+    lifespan=lifespan,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,17 +67,6 @@ app.add_middleware(
 class AskRequest(BaseModel):
     question: str = Field(min_length=2, max_length=500)
     session_id: str = "default"
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    await store.init_store()
-    log.info("api.startup", extra={"context": {"store": "ready"}})
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    await store.close_store()
 
 
 @app.get("/health")
@@ -92,13 +105,15 @@ async def ask_stream(req: AskRequest) -> StreamingResponse:
             #   updates：每节点增量（node/status/answer 事件从这里推）
             #   values ：每节点后的全量快照（最后一个就是终态，citations 要全量）
             # 曾经 astream(updates) 之后又 await ask() 重跑一遍完整图：
-            # 一次 SSE 请求触发两轮 LLM 调用（成本翻倍、延迟翻倍），且
-            # /ask 与 /ask/sync 并发时 checkpointer 两路写可能把"未初始化"
-            # 的旧状态读回来——修复见 README ADR（D7）。
+            # 一次 SSE 请求触发两轮 LLM 调用（成本翻倍、延迟翻倍）。
+            # 修复：一次 astream 同时拿 updates（节点事件）和 values（终态），
+            # 由 test_sse_single_run 的"一调用就炸"探针守护回归（README D7）。
+            # 本图未挂 checkpointer（无会话持久化诉求），状态只活在单次请求里。
             async for mode, chunk in graph.astream(
                 {
                     "question": req.question,
                     "session_id": req.session_id,
+                    "original_question": req.question,
                     "status": "running",
                     "retry_count": 0,
                 },

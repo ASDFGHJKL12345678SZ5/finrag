@@ -76,6 +76,32 @@ def fuse(
     return out
 
 
+async def keyword_weights(question: str) -> dict[str, float]:
+    """关键词路的 IDF + 指标词加权（hybrid_search 与评测共用同一份权重）。
+
+    为什么要共享：评测的三策略对比要公平——keyword_only 与 hybrid 只应差
+    "检索策略"，不应差"打分函数"。早期版评测自己不带 weights 调关键词路，
+    before/after 表把关键词路加权的增益错算成了融合的功劳。
+    """
+    from app.rag.store import (
+        _extract_terms,
+        boost_metric_terms,
+        idf_weights,
+        term_df,
+    )
+
+    terms = _extract_terms(question)[:12]
+    pool = store.get_pool()
+    async with pool.acquire() as conn:
+        n_chunks = await conn.fetchval("SELECT count(*) FROM rag.chunks")
+    df = await term_df(terms)
+    # N 用块数而非文档数：IDF 的语义单元是"块被检索到"，与召回的粒度一致
+    weights = idf_weights(terms, df, n_chunks)
+    # 指标词加权：查询的意图核心是指标（归母净利润），不是公司名——
+    # 公司名只定位文档，指标才定位到真正回答问题的块
+    return boost_metric_terms(question, weights)
+
+
 async def hybrid_search(
     question: str, industry: str | None = None, top_k: int | None = None
 ) -> list[dict]:
@@ -88,23 +114,9 @@ async def hybrid_search(
     vector_rows = await store.vector_search(qv, top_k=settings.retrieve_top_k, industry=industry)
     # IDF 加权：稀有词（指标名）比常见词（公司名）更能定位到正确块——
     # 评测实测：没有 IDF 时问"归母净利润"捞回的是只写营业收入的概况块，
-    # answer_accuracy 卡在 63%
-    from app.rag.store import (
-        _extract_terms,
-        boost_metric_terms,
-        idf_weights,
-        term_df,
-    )
+    # answer_accuracy 卡在 63%（权重逻辑见 keyword_weights）
 
-    terms = _extract_terms(question)[:12]
-    pool = store.get_pool()
-    async with pool.acquire() as conn:
-        n_docs = await conn.fetchval("SELECT count(*) FROM rag.chunks")
-    df = await term_df(terms)
-    weights = idf_weights(terms, df, n_docs)
-    # 指标词加权：查询的意图核心是指标（归母净利润），不是公司名——
-    # 公司名只定位文档，指标才定位到真正回答问题的块
-    weights = boost_metric_terms(question, weights)
+    weights = await keyword_weights(question)
     keyword_rows = await store.keyword_search(
         question, top_k=settings.retrieve_keyword_k, industry=industry, weights=weights
     )

@@ -13,7 +13,15 @@ from __future__ import annotations
 
 import os
 import re
+from functools import lru_cache
 from typing import Any, Protocol
+
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -71,30 +79,49 @@ class MockLLM:
         return "根据检索到的研报内容。" + "".join(parts)
 
 
-class OpenAILLM:
-    """OpenAI 兼容客户端（DeepSeek）。仅在 real 模式使用。"""
-
-    name = "deepseek-chat"
-
-    def __init__(self) -> None:
-        from openai import OpenAI  # 延迟导入：mock 模式不装也能跑
-
-        settings = get_settings()
-        self._client = OpenAI(
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key or os.environ.get("LLM_API_KEY", ""),
-        )
-        self._model = settings.llm_model
-
-    def generate(self, prompt: str, **kwargs: Any) -> str:
-        resp = self._client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=kwargs.get("temperature", 0.1),
-        )
-        return resp.choices[0].message.content or ""
-
-
+# 真实模式 LLM 调用策略（最终审查修复）：
+# - timeout=60：OpenAI SDK 默认 600s——真实模式下一次挂起会把整个 uvicorn
+#   worker 冻结 10 分钟，并发 /ask 全部排队（mock 压测数字掩盖了这点）。
+# - SDK 层 max_retries=0 + tenacity 3 次指数退避：重试策略收敛到一处、
+#   可日志观测；两层都开会长成 3x3=9 次调用，成本失控。
+LLM_TIMEOUT_S = 60.0
+LLM_MAX_ATTEMPTS = 3
+
+
+class OpenAILLM:
+    """OpenAI 兼容客户端（DeepSeek）。仅在 real 模式使用。"""
+
+    name = "deepseek-chat"
+
+    def __init__(self) -> None:
+        from openai import OpenAI  # 延迟导入：mock 模式不装也能跑
+
+        settings = get_settings()
+        self._client = OpenAI(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key or os.environ.get("LLM_API_KEY", ""),
+            timeout=LLM_TIMEOUT_S,
+            max_retries=0,
+        )
+        self._model = settings.llm_model
+        self.calls = 0
+
+    @retry(
+        retry=retry_if_exception_type(Exception),
+        stop=stop_after_attempt(LLM_MAX_ATTEMPTS),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        reraise=True,
+    )
+    def generate(self, prompt: str, **kwargs: Any) -> str:
+        self.calls += 1
+        resp = self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=kwargs.get("temperature", 0.1),
+        )
+        return resp.choices[0].message.content or ""
+
+
 def _extract_field(prompt: str, field: str) -> str:
     """从 prompt 里取 'field：xxx' 行的值。"""
     for line in prompt.splitlines():
@@ -112,8 +139,8 @@ def _extract_evidence(prompt: str) -> list[tuple[str, str]]:
         正文第二行...
     [cN] 行是标题，跟在它后面、直到空行/下一个 [cN] 的非空行才是正文。
     必须保留原始编号——mock 自己重新编号会指错证据，引用校验必然误杀
-    （ Smoke 教训：prompt 里 [c2] 的证据被标成 [c1] 输出，校验按 [c1]
-    回溯到的是一块无关 chunk）。
+    （prompt 里 [c2] 的证据被标成 [c1] 输出，校验按 [c1] 回溯到的是一块
+    无关 chunk）。
     """
     evidence: list[tuple[str, str]] = []
     lines = prompt.splitlines()
@@ -145,9 +172,15 @@ def _extract_evidence(prompt: str) -> list[tuple[str, str]]:
         i += 1
     return evidence
 
-
-def get_llm() -> LLM:
-    settings = get_settings()
-    if settings.llm_mode == "mock":
-        return MockLLM()
+def get_llm() -> LLM:
+    """按配置返回 LLM。单件缓存：真实模式下每个节点都新建 client/连接池
+    纯属浪费，MockLLM 的 calls 计数也才能被读到（测试可断言）。"""
+    return _llm_singleton()
+
+
+@lru_cache(maxsize=1)
+def _llm_singleton() -> LLM:
+    settings = get_settings()
+    if settings.llm_mode == "mock":
+        return MockLLM()
     return OpenAILLM()

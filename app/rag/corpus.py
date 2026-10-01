@@ -43,6 +43,45 @@ class Fact:
     evidence_terms: list[str]  # 证据 chunk 必须包含的词（检索命中判据）
 
 
+class FactRegistry:
+    """事实登记表：语料产出的全部 (fact_id -> Fact) 索引（最终审查修复）。
+
+    早期版 README/runner docstring 一直引用 FactRegistry，实现却只有
+    all_facts() 列表推导——名字只活在文档里。现在把它落成真类型：build 时
+    登记、by_id 回溯、questions 供评测遍历，"评测 ground truth 与语料
+    同源"由此有代码对应物。
+    """
+
+    def __init__(self) -> None:
+        self._facts: dict[str, Fact] = {}
+
+    def register(self, fact: Fact) -> None:
+        if fact.fact_id in self._facts:
+            raise ValueError(f"fact_id 重复登记: {fact.fact_id}（语料生成有 bug）")
+        self._facts[fact.fact_id] = fact
+
+    def by_id(self, fact_id: str) -> Fact:
+        return self._facts[fact_id]
+
+    def facts(self) -> list[Fact]:
+        return list(self._facts.values())
+
+    def questions(self) -> list[tuple[str, Fact]]:
+        """[(问题文本, 对应事实)]——评测 driver 的遍历入口。"""
+        return [(f.question, f) for f in self._facts.values()]
+
+    def __len__(self) -> int:
+        return len(self._facts)
+
+
+def build_registry(reports: list[Report]) -> FactRegistry:
+    """从语料构建事实登记表（all_facts 的同源版本，数据完全一致）。"""
+    registry = FactRegistry()
+    for r in reports:
+        for f in r.facts:
+            registry.register(f)
+    return registry
+
 @dataclass
 class Report:
     source: str
@@ -155,4 +194,5 @@ def build_corpus(n_reports: int = 30, seed: int = 20260929) -> list[Report]:
 
 
 def all_facts(reports: list[Report]) -> list[Fact]:
+    """便捷入口：直接要列表用这个；要登记表语义（按 id 回溯）用 build_registry。"""
     return [f for r in reports for f in r.facts]

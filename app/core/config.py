@@ -45,7 +45,6 @@ class Settings(BaseSettings):
     retrieve_keyword_k: int = 4    # 关键词召回条数（并数去重后重排）
 
     # ---- 引用校验（D5）----
-    min_citation_overlap: float = 0.6  # 论断与引用 chunk 的最低重合度
 
     # ---- LLM ----
     # mock：规则假模型（CI/无 key 可复现，含幻觉型威胁模拟）

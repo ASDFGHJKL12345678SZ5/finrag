@@ -32,6 +32,12 @@ from app.rag.verify import verify_answer
 
 log = get_logger("eval")
 
+# 评测默认 mock 模式：CI/无 key 环境秒级跑完（模型下载只在真实标定时发生）。
+# 必须在任何 get_settings() 调用之前设——settings 是 lru_cache 单件，
+# 早期版把这行放在 _reset_and_seed 里（init_store 之后），缓存已定值，
+# 设了也白设（死代码）；真实标定要显式 EMBEDDING_MODE=local。
+os.environ.setdefault("EMBEDDING_MODE", "mock")
+
 _HALLUCINATION_PREFIX = "预测"
 
 
@@ -46,7 +52,6 @@ async def init_eval_store() -> None:
 
 
 async def _reset_and_seed(n_reports: int, seed: int):
-    os.environ["EMBEDDING_MODE"] = os.environ.get("EMBEDDING_MODE", "mock")
     pool = store.get_pool()
     async with pool.acquire() as conn:
         await conn.execute("TRUNCATE rag.documents CASCADE")
@@ -62,16 +67,25 @@ async def _search_strategy(
     """按策略检索：vector_only / keyword_only / hybrid。"""
     qv = embed_query(question)
     v_rows = await store.vector_search(qv, top_k=top_k, industry=industry)
-    k_rows = await store.keyword_search(question, top_k=top_k, industry=industry)
     if strategy == "vector_only":
         rows = v_rows
-    elif strategy == "keyword_only":
-        rows = k_rows
     else:
-        settings = get_settings()
-        vw = 0.0 if settings.embedding_mode == "mock" else settings.vector_weight
-        kw = 1.0 if settings.embedding_mode == "mock" else settings.keyword_weight
-        rows = fuse(v_rows, k_rows, vector_weight=vw, keyword_weight=kw)
+        # keyword_only/hybrid 共用系统同一份 IDF+指标词加权（keyword_weights）：
+        # 三策略对比只允许差"检索策略"，不允许差打分函数——早期版 keyword_only
+        # 不传 weights，把关键词路加权的增益错算进了 hybrid 的账。
+        from app.rag.retrieve import keyword_weights
+
+        weights = await keyword_weights(question)
+        k_rows = await store.keyword_search(
+            question, top_k=top_k, industry=industry, weights=weights
+        )
+        if strategy == "keyword_only":
+            rows = k_rows
+        else:
+            settings = get_settings()
+            vw = 0.0 if settings.embedding_mode == "mock" else settings.vector_weight
+            kw = 1.0 if settings.embedding_mode == "mock" else settings.keyword_weight
+            rows = fuse(v_rows, k_rows, vector_weight=vw, keyword_weight=kw)
     return rows[:top_k]
 
 

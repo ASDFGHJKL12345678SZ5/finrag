@@ -13,7 +13,8 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "asyncpg>=0.29",              # pgvector 检索（异步连接池）
-    "pgvector>=0.3",              # Python 侧向量类型支持
+    # pgvector Python 库不装：向量以逗号分隔文本由 asyncpg 直传原生向量字面量，
+    # 全程不需要客户端侧类型支持（最终审查清理：依赖表与真实用法对齐）
     "numpy>=1.26",                # 向量运算（归一化/相似度）
     "fastembed>=0.3",             # 本地 ONNX embedding（bge-small-zh-v1.5）
     "httpx>=0.27",
@@ -30,7 +31,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["app*", "eval*"]
+include = ["app*"]  # 评测在 app/eval/ 下（tests 不走打包）
 
 [tool.ruff]
 line-length = 100
@@ -42,4 +43,4 @@ asyncio_default_fixture_loop_scope = "module"
 testpaths = ["tests"]
 
 [tool.ruff.lint.per-file-ignores]
-"eval/*" = ["E501"]
+"app/eval/*" = ["E501"]
