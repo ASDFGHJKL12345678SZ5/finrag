@@ -1,8 +1,8 @@
-import { ref, onScopeDispose } from 'vue'
+import { reactive, ref, onScopeDispose } from 'vue'
 import { askReducer, initialState, type AskState } from '@/services/reducer'
 import { askStream, ApiError } from '@/services/api'
 import { createRound, type Round } from '@/services/round'
-import { createHealthMonitor, type HealthMonitor, type HealthState } from '@/services/health'
+import { createHealthMonitor, type HealthDeps, type HealthMonitor, type HealthState } from '@/services/health'
 
 // Vue 薄接线层（与 datacrew 同构）：轮次/健康在纯模块（有单测），这里只接线。
 
@@ -24,12 +24,17 @@ export function useAsk() {
   const sessionId = ref(localStorage.getItem('finrag.sessionId') || 'demo-001')
   let round: Round | null = null
 
-  const health: HealthMonitor = createHealthMonitor({
+  const healthOptions: HealthDeps = {
     probe: probeHealth,
     intervalMs: HEALTH_INTERVAL_MS,
     probeTimeoutMs: HEALTH_TIMEOUT_MS,
-  })
-  const healthState: HealthState = health.state
+  }
+  const health: HealthMonitor = createHealthMonitor(healthOptions)
+  // Vue 层自持响应式状态，纯模块经回调通知（不能 reactive(health.state)：
+  // 纯模块按原始引用改对象，代理 setter 不触发——界面永远停在“探测中”，
+  // 见 tests/health.reactive.test.ts 的回归用例）。
+  const healthState = reactive<HealthState>({ ...health.state })
+  healthOptions.onStateChange = (s: HealthState) => Object.assign(healthState, s)
   health.start()
   onScopeDispose(() => health.stop())
 

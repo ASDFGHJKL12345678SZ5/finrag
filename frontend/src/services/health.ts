@@ -15,6 +15,10 @@ export interface HealthState {
 }
 
 export interface HealthDeps {
+  /** 探测结果变化通知：Vue 层据此更新自己的响应式状态。
+   *  为什么用回调而不是让调用方 reactive(state)：纯模块按原始引用改对象，
+   *  reactive 代理的 setter 不会触发（实测踩坑），界面会永远停在“探测中”。 */
+  onStateChange?: (s: HealthState) => void
   probe: (signal: AbortSignal) => Promise<boolean>
   intervalMs: number
   probeTimeoutMs: number
@@ -55,17 +59,18 @@ export function createHealthMonitor(deps: HealthDeps): HealthMonitor {
     if (stopped) return
     if (ok) {
       state.fails = 0
-      if (state.status !== "ok") {
-        state.status = "ok"
+      if (state.status !== 'ok') {
+        state.status = 'ok'
         state.since = now()
       }
     } else {
       state.fails += 1
-      if (state.status !== "unreachable") {
-        state.status = "unreachable"
+      if (state.status !== 'unreachable') {
+        state.status = 'unreachable'
         state.since = now()
       }
     }
+    deps.onStateChange?.(state)
   }
 
   function schedule(): void {
