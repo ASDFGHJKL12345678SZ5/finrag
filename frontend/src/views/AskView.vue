@@ -1,7 +1,6 @@
 <script setup lang="ts">
 // 问答主页面：接线层（判断逻辑在 reducer/api/解析器中，均有单测覆盖）。
 import AskForm from '@/components/AskForm.vue'
-import EventTimeline from '@/components/EventTimeline.vue'
 import MarkdownBlock from '@/components/MarkdownBlock.vue'
 import CitationsPanel from '@/components/CitationsPanel.vue'
 import VerdictsPanel from '@/components/VerdictsPanel.vue'
@@ -18,6 +17,7 @@ const PHASE_LABEL: Record<string, string> = {
   done: '已完成',
   refused: '已拒答',
   error: '失败',
+  cancelled: '已取消',
 }
 function phaseLabel(): string {
   return PHASE_LABEL[state.value.phase] ?? state.value.phase
@@ -65,9 +65,16 @@ function phaseLabel(): string {
         </div>
       </div>
 
+      <p v-if="state.phase === 'cancelled'" class="cancel-banner rise">本轮已取消。上方保留已流式产出的部分内容供参考。</p>
+
       <div v-if="state.streamed" class="card answer rise">
         <div class="answer-head">
           <span class="panel-title">答案</span>
+          <span class="meta">
+            <span v-if="state.totalMs != null">{{ state.totalMs }} ms</span>
+            <span v-if="state.citations.length > 0">引用 × {{ state.citations.length }}</span>
+            <span v-if="state.retryCount > 0">补偿检索 {{ state.retryCount }}</span>
+          </span>
           <span v-if="state.phase === 'streaming'" class="pulse hint">生成中<span class="stream-caret" /></span>
         </div>
         <MarkdownBlock :content="state.streamed" />
@@ -75,12 +82,6 @@ function phaseLabel(): string {
 
       <CitationsPanel :citations="state.citations" />
       <VerdictsPanel :verdicts="state.verdicts" />
-      <EventTimeline
-        :timeline="state.timeline"
-        :status="state.status"
-        :retry-count="state.retryCount"
-        :total-ms="state.totalMs"
-      />
     </template>
 
     <div v-else class="empty">

@@ -2,7 +2,7 @@
 // 与 datacrew 的 reducer 同构，差异只有事件集合。
 import type { RagEvent, Citation, Verdict, NodeEvent, StatusEvent, AnswerDeltaEvent, RefuseEvent, ErrorEvent } from '@/types/events'
 
-export type Phase = 'idle' | 'running' | 'streaming' | 'done' | 'refused' | 'error'
+export type Phase = 'idle' | 'running' | 'streaming' | 'done' | 'refused' | 'error' | 'cancelled'
 
 export interface TimelineEntry {
   node: string
@@ -40,6 +40,7 @@ export type AskAction =
   | { type: 'start'; question: string }
   | { type: 'event'; ev: RagEvent }
   | { type: 'reset' }
+  | { type: 'cancel' }
 
 export function askReducer(state: AskState, action: AskAction): AskState {
   switch (action.type) {
@@ -47,6 +48,9 @@ export function askReducer(state: AskState, action: AskAction): AskState {
       return { ...initialState, phase: 'running', question: action.question }
     case 'reset':
       return initialState
+    case 'cancel':
+      // 主动取消：保留已流式产出的答案作证据，明确标记未完成
+      return { ...state, phase: 'cancelled' }
     case 'event':
       return applyEvent(state, action.ev)
   }

@@ -1,14 +1,11 @@
 // useAsk：reducer + api 客户端接到 Vue 响应式（只做接线）。
-// 健壮性三件事（与 datacrew 前端同款，真实事故驱动）：
-//  1. signal 发给 fetch——取消按钮必须真的能掐断请求；
-//  2. 僵死看门狗：连接被静默掐断（容器重启/代理断）时流既不报错也不结束，
-//     N 秒无字节主动 abort 并明确报错；
-//  3. EOF 兜底：流正常结束但状态机还停在 running = 终态事件没来，按错误收尾。
+// 健壮性：硬超时看门狗（30s 无事件，UI 必须收口，不依赖 abort 是否传播）+
+// EOF 兜底（流结束但还在 running = 终态丢失）+ 取消 = 明确的“已取消”状态。
 import { ref } from 'vue'
 import { askReducer, initialState, type AskState } from '@/services/reducer'
 import { askStream, ApiError } from '@/services/api'
 
-const INACTIVITY_MS = 60_000
+const INACTIVITY_MS = 30_000
 
 export function useAsk() {
   const state = ref<AskState>({ ...initialState })
@@ -33,7 +30,12 @@ export function useAsk() {
     let timedOut = false
     let timer: number | undefined
     const arm = () => {
-      timer = window.setTimeout(() => { timedOut = true; own.abort() }, INACTIVITY_MS)
+      timer = window.setTimeout(() => {
+        timedOut = true
+        own.abort()
+        // 代理层可能吞掉 abort 的传播——UI 在这里无条件收口
+        fail(`连接 ${INACTIVITY_MS / 1000} 秒无新事件，已自动断开（后端无响应或连接被中断）`)
+      }, INACTIVITY_MS)
     }
     const disarm = () => { if (timer) { window.clearTimeout(timer); timer = undefined } }
     try {
@@ -47,9 +49,8 @@ export function useAsk() {
       }
     } catch (e) {
       if (e instanceof Error && e.name === 'AbortError') {
-        if (timedOut) {
-          fail(`连接 ${INACTIVITY_MS / 1000} 秒无响应，已自动断开（后端不可达或被中断）`)
-        }
+        if (timedOut) return
+        state.value = askReducer(state.value, { type: 'cancel' })
         return
       }
       const msg = e instanceof ApiError ? `HTTP ${e.status}: ${e.message}` : String(e)
