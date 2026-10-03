@@ -16,11 +16,17 @@ const html = computed(() =>
 </template>
 
 <style scoped>
-.markdown :deep(table) { border-collapse: collapse; margin: 10px 0; }
-.markdown :deep(th), .markdown :deep(td) { border: 1px solid var(--border); padding: 5px 12px; }
-.markdown :deep(th) { background: var(--bg-elevated); }
-.markdown :deep(h1), .markdown :deep(h2), .markdown :deep(h3) { margin: 14px 0 6px; }
-.markdown :deep(code) { background: #0b0f18; padding: 1px 6px; border-radius: 5px; }
+.markdown :deep(table) { border-collapse: collapse; margin: 12px 0; display: block; overflow: auto; }
+.markdown :deep(th), .markdown :deep(td) { border: 1px solid var(--line-strong); padding: 6px 14px; }
+.markdown :deep(th) { background: var(--paper-2); color: var(--ink-dim); font-family: var(--mono); font-size: 12.5px; }
+.markdown :deep(h1), .markdown :deep(h2), .markdown :deep(h3) {
+  font-family: var(--serif); margin: 16px 0 6px; color: var(--ink);
+}
+.markdown :deep(p) { margin: 9px 0; line-height: 1.9; }
+.markdown :deep(code) { background: var(--paper-2); padding: 1px 6px; border-radius: 5px; color: var(--accent-deep); font-family: var(--mono); font-size: 12.5px; }
+.markdown :deep(pre) { background: var(--paper-2); }
 .markdown :deep(pre code) { background: none; padding: 0; }
 .markdown :deep(ul) { margin: 6px 0; padding-left: 22px; }
+.markdown :deep(li) { margin: 3px 0; line-height: 1.8; }
+.markdown :deep(strong) { color: var(--ink); }
 </style>

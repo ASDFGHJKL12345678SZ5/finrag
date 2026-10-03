@@ -10,6 +10,7 @@ export default defineConfig({
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
   },
   server: {
+    strictPort: true, // 端口被占时直接失败：绝不静默换端口（曾因此误连到别的实例）
     port: 5174,
     proxy: {
       '/ask': { target: 'http://127.0.0.1:8001', changeOrigin: true },
