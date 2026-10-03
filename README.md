@@ -7,6 +7,9 @@
 
 ## 1. 系统架构
 
+客户端两层：**Vue 3 SPA（`frontend/`，端口 5174）经 SSE 消费 `/ask` 事件流；
+`ask.py` CLI 打印答案+引用（也当 API 的活文档）。**
+
 ```
                 ┌──────────────────────────────────────────────┐
                 │                  FastAPI (D5)                 │
@@ -79,9 +82,15 @@ app/
   eval/runner.py      评测 driver：检索命中/拒答/引用/答案正确率
   eval/schema.py      评测指标定义
 ask.py                CLI 问一句并打印答案+引用
+frontend/
+  package.json        Vue 3 + Vite + vue-router + marked/dompurify + vitest
+  src/services/       SSE 解析器（data-only 帧）+ 轮次状态机 reducer + API 客户端
+  src/views/          AskView：提问/流式答案/引用面板/校验明细/拒答横幅
+  src/components/     CitationsPanel（引用出处）/VerdictsPanel（逐论断裁定）等
+  tests/              11 项 vitest 单测（断帧重组/CRLF/多帧粘包/事件机）
 scripts/load_test.py 压测（含 SOCKS 代理选项）
 deploy/postgres/init/ 实例级扩展（vector + pg_trgm）
-tests/                36 个测试：分块不变量/向量契约/语料合法性/检索集成/校验器/SSE 单跑回归
+tests/                40 个测试：分块不变量/向量契约/语料合法性/检索集成/校验器/SSE 单跑回归
 ```
 
 ## 3. 设计决策日志（ADR）
@@ -208,10 +217,18 @@ $env:EMBEDDING_MODE="mock"; python -m app.rag --reports 30     # Windows(pwsh)
 
 # 4. 测试
 $env:EMBEDDING_MODE="mock"; python -m pytest tests/ -q         # Windows(pwsh)
+cd frontend; npm run build; npm test; cd ..                     # 前端 11 项 vitest + 类型检查
 # EMBEDDING_MODE=mock python -m pytest tests/ -q                # Linux/macOS
 
 # 5. 起 API（FastAPI，端口 8001；swagger: http://localhost:8001/docs）
 python -m app.main
+
+
+# 5.5 启动 Vue 前端（另开终端；dev 经 Vite proxy 转发到 :8001，免 CORS）
+cd frontend
+npm install
+npm run dev          # http://localhost:5174
+cd ..
 
 # 6. 命令行问一句（打印答案 + 引用 chunk）
 python ask.py "宁德润能2025年的营业收入是多少？"
