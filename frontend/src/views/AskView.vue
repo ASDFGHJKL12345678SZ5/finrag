@@ -7,8 +7,17 @@ import VerdictsPanel from '@/components/VerdictsPanel.vue'
 import { useAsk } from '@/composables/useAsk'
 
 const {
-  state, running, errorMessage, sessionId, setSessionId, ask, cancel, reset,
+  state, running, errorMessage, sessionId, setSessionId, healthState, ask, cancel, reset,
 } = useAsk()
+
+import { computed, ref } from 'vue'
+
+// 健康门控：后端不可达时禁止提问（事故教训：朝暂停的容器开枪只会挂死）
+const healthDown = computed(() => healthState.status !== 'ok')
+const downSeconds = ref(0)
+setInterval(() => {
+  downSeconds.value = Math.max(0, Math.round((Date.now() - healthState.since) / 1000))
+}, 1000)
 
 const PHASE_LABEL: Record<string, string> = {
   idle: '待命',
@@ -38,7 +47,12 @@ function phaseLabel(): string {
       <button class="btn btn-ghost" :disabled="running" @click="reset">清空本轮</button>
     </div>
 
-    <AskForm :disabled="running" @submit="ask" />
+    <p v-if="healthDown" class="health-banner rise">
+  <b>后端不可达{{ healthState.status === 'probing' ? '（探测中）' : '已 ' + downSeconds + 's' }}</b>
+  提问已临时禁用。检查后端进程（<code>python -m app.main</code> :8001）或容器是否被暂停。
+</p>
+
+<AskForm :disabled="running || healthDown" @submit="ask" />
 
     <p v-if="errorMessage" class="error-banner rise">
       <b>出错了</b>{{ errorMessage }}
@@ -193,4 +207,10 @@ function phaseLabel(): string {
 @media (max-width: 720px) {
   .paths { grid-template-columns: 1fr; }
 }
+.health-banner {
+  display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap;
+  background: #fdf3e0; border: 1px solid #e6c689; color: #8a6116;
+  border-radius: 10px; padding: 10px 14px; font-size: 13px;
+}
+.health-banner code { font-family: var(--mono, monospace); font-size: 12px; }
 </style>

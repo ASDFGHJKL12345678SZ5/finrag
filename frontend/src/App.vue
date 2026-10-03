@@ -7,7 +7,8 @@ let timer: number | undefined
 
 async function checkHealth() {
   try {
-    const res = await fetch('/health')
+    // 6s 超时：容器被 docker pause 时握手成功但永不响应，不能假装绿。
+    const res = await fetch('/health', { signal: AbortSignal.timeout(6_000) })
     apiOk.value = res.ok
   } catch {
     apiOk.value = false
