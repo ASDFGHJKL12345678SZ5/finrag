@@ -2,6 +2,7 @@
 // 校验明细：verify.py 的逐论断裁定——金融场景"带病输出比拒答危险"，
 // 所以每个含数字的论断都必须被证据词面支持，一个不过就整篇拒答。
 import { computed } from 'vue'
+import Badge from './base/Badge.vue'
 import type { Verdict } from '@/types/events'
 
 const props = defineProps<{ verdicts: Verdict[] }>()
@@ -14,9 +15,7 @@ const allPassed = computed(() => passed.value === props.verdicts.length)
   <div v-if="verdicts.length > 0" class="card verdicts">
     <div class="panel-head">
       <h3>引用校验明细</h3>
-      <span class="tag" :class="allPassed ? 'ok' : 'err'">
-        {{ passed }}/{{ verdicts.length }} 通过
-      </span>
+      <Badge :tone="allPassed ? 'ok' : 'err'">{{ passed }}/{{ verdicts.length }} 通过</Badge>
     </div>
     <div v-for="(v, i) in verdicts" :key="i" class="verdict" :class="v.supported ? 'ok' : 'bad'">
       <span class="mark">{{ v.supported ? '✓' : '✗' }}</span>
@@ -36,10 +35,10 @@ const allPassed = computed(() => passed.value === props.verdicts.length)
 .panel-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 .panel-head h3 {
   margin: 0; font-size: 13px; letter-spacing: 2px; color: var(--accent-deep);
-  text-transform: uppercase; font-weight: 700;
+  text-transform: uppercase; font-weight: 700; font-family: var(--serif);
 }
 .verdict {
-  display: flex; gap: 12px; padding: 10px 12px; border-radius: 8px; margin-bottom: 8px;
+  display: flex; gap: 12px; padding: 10px 12px; border-radius: var(--radius-s); margin-bottom: 8px;
   border: 1px solid var(--line); background: var(--paper-2);
 }
 .verdict:last-child { margin-bottom: 0; }

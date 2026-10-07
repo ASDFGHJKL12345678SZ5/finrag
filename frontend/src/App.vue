@@ -1,25 +1,16 @@
 <script setup lang="ts">
-// 应用外壳：阅读室式报头（品牌/连接/会话）+ 主阅读区。
-import { onMounted, onUnmounted, ref } from 'vue'
+// 应用外壳：阅读室式报头（品牌/连接）+ 主阅读区。
+// 重构点：报头健康灯不再自带 setInterval——与提问门控共用 useHealth() 单例。
+import { computed } from 'vue'
+import { useHealth } from '@/composables/useHealth'
 
-const apiOk = ref<boolean | null>(null)
-let timer: number | undefined
+const { state: health, probeNow } = useHealth()
 
-async function checkHealth() {
-  try {
-    // 6s 超时：容器被 docker pause 时握手成功但永不响应，不能假装绿。
-    const res = await fetch('/health', { signal: AbortSignal.timeout(6_000) })
-    apiOk.value = res.ok
-  } catch {
-    apiOk.value = false
-  }
-}
-
-onMounted(() => {
-  checkHealth()
-  timer = window.setInterval(checkHealth, 15_000)
-})
-onUnmounted(() => { if (timer) window.clearInterval(timer) })
+const HEALTH_TEXT = computed(() => ({
+  probing: '检测中',
+  ok: '知识库在线',
+  unreachable: '后端不可达',
+}))
 </script>
 
 <template>
@@ -32,10 +23,10 @@ onUnmounted(() => { if (timer) window.clearInterval(timer) })
           <p>带引用生成的金融知识库 · 引用校验不过则拒答</p>
         </div>
       </div>
-      <div class="health" :class="apiOk === null ? 'unknown' : apiOk ? 'up' : 'down'">
+      <button class="health" :class="health.status" title="点击立即重新探测" @click="probeNow">
         <span class="dot" />
-        <span>{{ apiOk === null ? '检测中' : apiOk ? '知识库在线' : '后端不可达' }}</span>
-      </div>
+        <span>{{ HEALTH_TEXT[health.status] ?? health.status }}</span>
+      </button>
     </header>
     <main class="reading-room">
       <router-view />
@@ -62,10 +53,15 @@ onUnmounted(() => { if (timer) window.clearInterval(timer) })
 }
 .brand-text h1 { margin: 0; font-family: var(--serif); font-size: 21px; letter-spacing: 1px; }
 .brand-text p { margin: 1px 0 0; font-size: 12.5px; color: var(--ink-dim); }
-.health { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-dim); font-family: var(--mono); }
+.health {
+  display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-dim);
+  font-family: var(--mono); background: none; border: none; padding: 4px 8px; border-radius: 8px;
+}
+.health:hover { background: var(--paper-2); }
 .health .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-faint); flex: none; }
 .health.up .dot { background: var(--teal); box-shadow: 0 0 8px rgba(47, 125, 107, 0.6); }
 .health.down .dot { background: var(--red); }
+.health.unreachable .dot { animation: pulse 1.4s ease-in-out infinite; }
 .reading-room { flex: 1; width: 100%; max-width: 1060px; margin: 0 auto; padding: 28px 32px 60px; }
 .colophon {
   display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;

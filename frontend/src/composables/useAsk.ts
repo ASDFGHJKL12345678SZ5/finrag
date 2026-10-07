@@ -1,54 +1,42 @@
-import { reactive, ref, onScopeDispose } from 'vue'
+import { ref, onScopeDispose } from 'vue'
 import { askReducer, initialState, type AskState } from '@/services/reducer'
 import { askStream, ApiError } from '@/services/api'
-import { createRound, type Round } from '@/services/round'
-import { createHealthMonitor, type HealthDeps, type HealthMonitor, type HealthState } from '@/services/health'
+import { createRound, type Round, type Settlement } from '@/services/round'
+import { getSessionId, setSessionId, onSessionChange } from '@/services/session'
+import { useHealth } from '@/composables/useHealth'
+import type { RagEvent } from '@/types/events'
 
 // Vue 薄接线层（与 datacrew 同构）：轮次/健康在纯模块（有单测），这里只接线。
+// 重构点：
+//   1. 修掉 run(gen: AsyncGenerator<never>) + 满屏 as never 的类型涂脂荡粉——
+//      事件类型本来就是 RagEvent，直抒胸臆；
+//   2. 健康探测改用全局单例 useHealth()（报头灯与提问门控同源）；
+//   3. 会话 ID 走 services/session.ts 单一事实源。
 
 const INACTIVITY_MS = 30_000
-const HEALTH_INTERVAL_MS = 15_000
-const HEALTH_TIMEOUT_MS = 6_000
 const LIVE_PHASES = ['running', 'streaming']
-
-function probeHealth(signal: AbortSignal): Promise<boolean> {
-  return fetch('/health', { signal })
-    .then((r) => r.ok)
-    .catch(() => false)
-}
 
 export function useAsk() {
   const state = ref<AskState>({ ...initialState })
   const running = ref(false)
   const errorMessage = ref('')
-  const sessionId = ref(localStorage.getItem('finrag.sessionId') || 'demo-001')
-  let round: Round | null = null
+  const sessionId = ref(getSessionId())
+  const offSession = onSessionChange((v) => { sessionId.value = v })
+  onScopeDispose(offSession)
 
-  const healthOptions: HealthDeps = {
-    probe: probeHealth,
-    intervalMs: HEALTH_INTERVAL_MS,
-    probeTimeoutMs: HEALTH_TIMEOUT_MS,
-  }
-  const health: HealthMonitor = createHealthMonitor(healthOptions)
-  // Vue 层自持响应式状态，纯模块经回调通知（不能 reactive(health.state)：
-  // 纯模块按原始引用改对象，代理 setter 不触发——界面永远停在“探测中”，
-  // 见 tests/health.reactive.test.ts 的回归用例）。
-  const healthState = reactive<HealthState>({ ...health.state })
-  healthOptions.onStateChange = (s: HealthState) => Object.assign(healthState, s)
-  health.start()
-  onScopeDispose(() => health.stop())
+  // 健康：全局单例（报头状态灯与提问门控共用同一个探测实程）
+  const { state: healthState, isDown: healthDown, probeNow } = useHealth()
 
-  function setSessionId(v: string) {
-    sessionId.value = v
-    localStorage.setItem('finrag.sessionId', v)
+  function setSessionIdValue(v: string) {
+    setSessionId(v)
   }
 
   function fail(msg: string) {
     errorMessage.value = msg
-    state.value = askReducer(state.value, { type: 'event', ev: { event: 'error', detail: msg } as never })
+    state.value = askReducer(state.value, { type: 'event', ev: { event: 'error', detail: msg } })
   }
 
-  function onSettle(kind: string) {
+  function onSettle(kind: Settlement) {
     if (kind === 'cancelled' && LIVE_PHASES.includes(state.value.phase)) {
       state.value = askReducer(state.value, { type: 'cancel' })
     }
@@ -56,7 +44,7 @@ export function useAsk() {
     round = null
   }
 
-  async function run(gen: AsyncGenerator<never>): Promise<void> {
+  async function run(gen: AsyncGenerator<RagEvent>): Promise<void> {
     running.value = true
     errorMessage.value = ''
     const r = round
@@ -68,7 +56,7 @@ export function useAsk() {
         state.value = askReducer(state.value, { type: 'event', ev })
         r.arm()
       }
-      if (r.settled !== 'cancelled' && state.value.phase === 'running') {
+      if (r.settled !== 'cancelled' && (state.value.phase === 'running' || state.value.phase === 'streaming')) {
         fail('连接中断：流已结束但未收到终态事件（answer / refuse / error）。请重试或检查后端')
       }
     } catch (e) {
@@ -80,6 +68,8 @@ export function useAsk() {
       if (r.settled === null) r.settle('done')
     }
   }
+
+  let round: Round | null = null
 
   function newRound(): Round {
     round?.disarm()
@@ -95,7 +85,7 @@ export function useAsk() {
   function ask(question: string) {
     state.value = askReducer(state.value, { type: 'start', question })
     const r = newRound()
-    return run(askStream(question, sessionId.value, r.signal) as never)
+    return run(askStream(question, sessionId.value, r.signal))
   }
 
   function cancel() {
@@ -109,5 +99,5 @@ export function useAsk() {
     running.value = false
   }
 
-  return { state, running, errorMessage, sessionId, setSessionId, healthState, ask, cancel, reset }
+  return { state, running, errorMessage, sessionId, setSessionId: setSessionIdValue, healthState, healthDown, probeNow, ask, cancel, reset }
 }

@@ -1,23 +1,28 @@
 <script setup lang="ts">
 // 问答主页面：接线层（判断逻辑在 reducer/api/解析器中，均有单测覆盖）。
+// 重构点：
+//   1. 答案抽出 AnswerCard（流式光标/耗时/复制按钮）；
+//   2. 执行轨迹 EventTimeline 上屏（节点耗时 + 补偿检索 ×N，之前只存不显）；
+//   3. 健康门控与报头灯共用 useHealth 单例，附"立即重试"。
+import { computed, onUnmounted, ref } from 'vue'
 import AskForm from '@/components/AskForm.vue'
-import MarkdownBlock from '@/components/MarkdownBlock.vue'
+import AnswerCard from '@/components/AnswerCard.vue'
+import EventTimeline from '@/components/EventTimeline.vue'
 import CitationsPanel from '@/components/CitationsPanel.vue'
 import VerdictsPanel from '@/components/VerdictsPanel.vue'
 import { useAsk } from '@/composables/useAsk'
 
 const {
-  state, running, errorMessage, sessionId, setSessionId, healthState, ask, cancel, reset,
+  state, running, errorMessage, sessionId, setSessionId, healthDown, healthState, probeNow,
+  ask, cancel, reset,
 } = useAsk()
 
-import { computed, ref } from 'vue'
-
-// 健康门控：后端不可达时禁止提问（事故教训：朝暂停的容器开枪只会挂死）
-const healthDown = computed(() => healthState.status !== 'ok')
+// 不可达持续多久：给用户"等了多久"的实感
 const downSeconds = ref(0)
-setInterval(() => {
+const timer = window.setInterval(() => {
   downSeconds.value = Math.max(0, Math.round((Date.now() - healthState.since) / 1000))
 }, 1000)
+onUnmounted(() => window.clearInterval(timer))
 
 const PHASE_LABEL: Record<string, string> = {
   idle: '待命',
@@ -28,45 +33,49 @@ const PHASE_LABEL: Record<string, string> = {
   error: '失败',
   cancelled: '已取消',
 }
-function phaseLabel(): string {
-  return PHASE_LABEL[state.value.phase] ?? state.value.phase
-}
+const phaseLabel = computed(() => PHASE_LABEL[state.value.phase] ?? state.value.phase)
 </script>
 
 <template>
   <div class="ask-view">
     <div class="session-bar">
       <label class="field">
-        <span>会话 ID（多轮指代消解生效范围）</span>
+        <span>会话 ID</span>
         <input
           :value="sessionId"
-          placeholder="同一 ID 才能追问"
+          placeholder="local-001"
           @input="setSessionId(($event.target as HTMLInputElement).value)"
         />
       </label>
       <button class="btn btn-ghost" :disabled="running" @click="reset">清空本轮</button>
     </div>
 
-    <p v-if="healthDown" class="health-banner rise">
-  <b>后端不可达{{ healthState.status === 'probing' ? '（探测中）' : '已 ' + downSeconds + 's' }}</b>
-  提问已临时禁用。检查后端进程（<code>python -m app.main</code> :8001）或容器是否被暂停。
-</p>
-
-<AskForm :disabled="running || healthDown" @submit="ask" />
-
-    <p v-if="errorMessage" class="error-banner rise">
-      <b>出错了</b>{{ errorMessage }}
+    <p class="session-hint">
+      单轮问答：本系统不做服务端会话持久化，<b>每轮请把限定条件说全</b>（不继承上一轮的口径与条件）。
     </p>
+
+    <div v-if="healthDown" class="banner health-banner rise">
+      <b>后端不可达{{ healthState.status === 'probing' ? '（探测中）' : '已 ' + downSeconds + 's' }}</b>
+      <span>提问已临时禁用。检查后端进程（<code>python -m app.main</code> :8001）或容器是否被暂停。</span>
+      <button class="btn btn-ghost btn-sm" @click="probeNow">立即重试</button>
+    </div>
+
+    <AskForm :disabled="running || healthDown" @submit="ask" />
+
+    <div v-if="errorMessage" class="banner error-banner rise">
+      <b>出错了</b><span>{{ errorMessage }}</span>
+    </div>
 
     <template v-if="state.phase !== 'idle'">
       <div class="question-line rise">
         <span class="q-tag">问</span>
         <span class="q-text">{{ state.question }}</span>
         <span class="phase-tag" :class="state.phase">
-          {{ phaseLabel() }}
+          {{ phaseLabel }}
+          <span v-if="running" class="pulse-dot">●</span>
         </span>
         <span v-if="running" class="running">
-          <button class="btn btn-ghost" style="padding: 2px 10px; font-size: 12px;" @click="cancel">取消</button>
+          <button class="btn btn-ghost btn-sm" @click="cancel">取消</button>
         </span>
       </div>
 
@@ -79,23 +88,21 @@ function phaseLabel(): string {
         </div>
       </div>
 
-      <p v-if="state.phase === 'cancelled'" class="cancel-banner rise">本轮已取消。上方保留已流式产出的部分内容供参考。</p>
+      <p v-if="state.phase === 'cancelled'" class="banner cancel-banner rise">本轮已取消。上方保留已产出的部分内容供参考。</p>
 
-      <div v-if="state.streamed" class="card answer rise">
-        <div class="answer-head">
-          <span class="panel-title">答案</span>
-          <span class="meta">
-            <span v-if="state.totalMs != null">{{ state.totalMs }} ms</span>
-            <span v-if="state.citations.length > 0">引用 × {{ state.citations.length }}</span>
-            <span v-if="state.retryCount > 0">补偿检索 {{ state.retryCount }}</span>
-          </span>
-          <span v-if="state.phase === 'streaming'" class="pulse hint">生成中<span class="stream-caret" /></span>
-        </div>
-        <MarkdownBlock :content="state.streamed" />
-      </div>
+      <AnswerCard
+        v-if="state.streamed"
+        :content="state.streamed"
+        :streaming="running && state.phase === 'streaming'"
+        :total-ms="state.totalMs"
+        :citation-count="state.citations.length"
+        :retry-count="state.retryCount"
+      />
 
       <CitationsPanel :citations="state.citations" />
       <VerdictsPanel :verdicts="state.verdicts" />
+
+      <EventTimeline :entries="state.timeline" />
     </template>
 
     <div v-else class="empty">
@@ -103,13 +110,13 @@ function phaseLabel(): string {
       <div class="paths">
         <div class="path ok">
           <div class="path-tag">有据可答</div>
-          <p>“宁德润能的毛利率是多少？”</p>
+          <p>"宁德润能的毛利率是多少？"</p>
           <span class="path-flow">混合检索（向量 + IDF 关键词）→ 引用校验 → 带引用生成</span>
         </div>
         <div class="path err">
           <div class="path-tag">零幻觉原则</div>
           <p>证据不足时选择拒答</p>
-          <span class="path-flow">引用校验不通过的论断，系统明说“证据不足”而非硬答（当前 mock 演示环境只走作答路径，真实模式/缺证据时触发拒答）</span>
+          <span class="path-flow">引用校验不通过的论断，系统明说"证据不足"而非硬答（当前 mock 演示环境只走作答路径，真实模式/缺证据时触发拒答）</span>
         </div>
       </div>
     </div>
@@ -122,34 +129,41 @@ function phaseLabel(): string {
 /* 会话条 */
 .session-bar {
   display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap;
-  padding: 12px 14px; background: var(--sheet); border: 1px solid var(--line); border-radius: 12px;
+  padding: 12px 14px; background: var(--sheet); border: 1px solid var(--line); border-radius: var(--radius-l);
 }
+.session-hint { margin: -6px 0 0; font-size: 11.5px; color: var(--ink-faint); line-height: 1.6; }
+.session-hint b { color: var(--ink-dim, var(--ink-faint)); font-weight: 600; }
 .field { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 240px; }
 .field span { font-size: 11.5px; color: var(--ink-faint); letter-spacing: 1px; }
 
-/* 错误条 */
-.error-banner {
-  display: flex; gap: 10px; align-items: baseline; margin: 0;
-  background: rgba(179, 65, 58, 0.07); border: 1px solid rgba(179, 65, 58, 0.4);
-  color: var(--red); border-radius: 10px; padding: 11px 16px; font-size: 13.5px;
+/* 横幅 */
+.banner {
+  display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin: 0;
+  border-radius: var(--radius-m); padding: 11px 16px; font-size: 13.5px;
 }
-.error-banner b { flex: none; }
+.banner b { flex: none; }
+.error-banner { background: var(--red-soft); border: 1px solid rgba(179, 65, 58, 0.4); color: var(--red); }
+.health-banner {
+  background: var(--gold-soft); border: 1px solid rgba(176, 132, 48, 0.45); color: #8a6116;
+  align-items: center;
+}
+.health-banner code { font-family: var(--mono, monospace); font-size: 12px; }
+.health-banner .btn { margin-left: auto; }
+.cancel-banner { background: var(--paper-2); border: 1px solid var(--line-strong); color: var(--ink-dim); }
 
 /* 问题行 */
-.question-line {
-  display: flex; gap: 10px; align-items: center; padding: 4px 2px;
-}
+.question-line { display: flex; gap: 10px; align-items: center; padding: 4px 2px; flex-wrap: wrap; }
 .q-tag {
   flex: none; width: 26px; height: 26px; border-radius: 50%; display: inline-grid; place-items: center;
   background: var(--accent); color: #fff; font-family: var(--serif); font-weight: 700; font-size: 14px;
 }
-.q-text {
-  font-family: var(--serif); font-size: 17px; font-weight: 700; letter-spacing: 0.5px;
-}
+.q-text { font-family: var(--serif); font-size: 17px; font-weight: 700; letter-spacing: 0.5px; }
 .phase-tag {
   margin-left: auto; font-size: 12px; font-family: var(--mono); color: var(--ink-dim);
   border: 1px solid var(--line-strong); border-radius: 999px; padding: 0 10px; background: var(--paper-2);
+  display: inline-flex; align-items: center; gap: 6px;
 }
+.pulse-dot { color: var(--gold); animation: pulse 1.4s ease-in-out infinite; font-size: 9px; }
 .phase-tag.running, .phase-tag.streaming { color: var(--gold); border-color: rgba(176, 132, 48, 0.4); }
 .phase-tag.done { color: var(--teal); border-color: rgba(47, 125, 107, 0.4); }
 .phase-tag.refused { color: var(--red); border-color: rgba(179, 65, 58, 0.4); }
@@ -158,8 +172,8 @@ function phaseLabel(): string {
 /* 拒答 */
 .refuse-banner {
   display: flex; gap: 16px; align-items: flex-start;
-  background: rgba(176, 132, 48, 0.06); border: 1px solid rgba(176, 132, 48, 0.45);
-  border-radius: 12px; padding: 16px 20px;
+  background: var(--gold-soft); border: 1px solid rgba(176, 132, 48, 0.45);
+  border-radius: var(--radius-l); padding: 16px 20px;
 }
 .stamp {
   flex: none; transform: rotate(-4deg);
@@ -171,24 +185,11 @@ function phaseLabel(): string {
 .refuse-body b { font-size: 14.5px; }
 .refuse-body .muted { font-size: 12.5px; }
 
-/* 答案纸面 */
-.answer {
-  background: var(--sheet);
-  box-shadow: 0 2px 6px rgba(90, 75, 55, 0.07), 0 16px 40px rgba(90, 75, 55, 0.1);
-  border-color: var(--line-strong);
-}
-.answer-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-.panel-title {
-  font-size: 12px; letter-spacing: 3px; color: var(--accent-deep);
-  text-transform: uppercase; font-weight: 700;
-}
-.hint { font-size: 12px; color: var(--gold); font-family: var(--mono); }
-
 /* 空态 */
 .empty h3 { margin: 10px 0 12px; font-size: 14px; color: var(--ink-dim); letter-spacing: 1px; }
 .paths { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .path {
-  background: var(--sheet); border: 1px solid var(--line); border-radius: 12px;
+  background: var(--sheet); border: 1px solid var(--line); border-radius: var(--radius-l);
   padding: 18px; display: flex; flex-direction: column; gap: 8px;
   transition: border-color .15s, transform .15s; box-shadow: var(--shadow);
 }
@@ -207,10 +208,4 @@ function phaseLabel(): string {
 @media (max-width: 720px) {
   .paths { grid-template-columns: 1fr; }
 }
-.health-banner {
-  display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap;
-  background: #fdf3e0; border: 1px solid #e6c689; color: #8a6116;
-  border-radius: 10px; padding: 10px 14px; font-size: 13px;
-}
-.health-banner code { font-family: var(--mono, monospace); font-size: 12px; }
 </style>
