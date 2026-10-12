@@ -84,6 +84,7 @@ async def ask_sync(req: AskRequest) -> dict:
         "question": req.question,
         "answer": final.get("answer", ""),
         "status": final.get("status", "failed"),
+        "refusal_reason": final.get("refusal_reason", ""),
         "citations": _citations(final),
         "verdicts": final.get("verdicts") or [],
         "retry_count": final.get("retry_count", 0),
@@ -144,7 +145,11 @@ async def ask_stream(req: AskRequest) -> StreamingResponse:
             else:
                 yield _sse({
                     "event": "refuse",
-                    "reason": "证据不足或引用校验未通过",
+                    # reason 保持前端既有契约（拒答横幅直接展示）；
+                    # 有确定性归因时给出具体原因（D13 充分性守卫的三档），
+                    # 前端零改动——只是文案从"一律证据不足"变成可解释的拒答
+                    "reason": _refusal_text(final.get("refusal_reason", "")),
+                    "refusal_reason": final.get("refusal_reason", ""),
                     "verdicts": final.get("verdicts") or [],
                     "answer": final.get("answer", ""),
                     "total_ms": total_ms,
@@ -154,6 +159,19 @@ async def ask_stream(req: AskRequest) -> StreamingResponse:
             yield _sse({"event": "error", "detail": str(exc)})
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+# 拒答归因码 -> 用户可读文案（与 app/rag/sufficiency.py、graph.py 的
+# refusal_reason 一一对应）。没有归因码时回退通用话术——契约不变。
+_REFUSAL_TEXTS = {
+    "retrieval_empty": "未检索到与问题相关的研报内容",
+    "year_not_in_evidence": "问题所问年份在知识库中没有数据",
+    "metric_not_in_evidence": "知识库不覆盖该指标，无法回答",
+}
+
+
+def _refusal_text(reason: str) -> str:
+    return _REFUSAL_TEXTS.get(reason, "证据不足或引用校验未通过")
 
 
 def _citations(final: dict) -> list[dict]:

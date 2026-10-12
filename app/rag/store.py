@@ -66,6 +66,9 @@ CREATE INDEX IF NOT EXISTS chunks_text_trgm
 """
 
 _pool: asyncpg.Pool | None = None
+# 公司名缓存（实体锚定用）：进程内，60s TTL，见 company_names()
+_company_cache: list[str] | None = None
+_company_cache_at: float = 0.0
 
 
 async def _ensure_hnsw_opclass(conn) -> None:
@@ -271,6 +274,28 @@ async def keyword_search(
     async with pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
     return [dict(r) for r in rows]
+
+
+async def company_names() -> list[str]:
+    """全部已知公司名（从 documents.source 解析：{industry}-{idx:03d}-{company}）。
+
+    实体锚定（D13）的输入：问题里出现哪个公司名，就把该公司文档的块
+    加分——易混公司对（共享前缀）下，完整实体名是唯一可靠的判别依据。
+    带 60s TTL 缓存：一次评测上千次检索，公司集合在评测周期内不变，
+    不该每次都查库（缓存是优化不是依赖，TTL 过期自然刷新）。
+    """
+    global _company_cache, _company_cache_at
+    import time as _time
+
+    now = _time.monotonic()
+    if _company_cache is not None and now - _company_cache_at < 60.0:
+        return list(_company_cache)
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT source FROM rag.documents")
+    names = [r["source"].split("-", 2)[2] for r in rows if r["source"].count("-") >= 2]
+    _company_cache, _company_cache_at = names, now
+    return list(names)
 
 
 async def term_df(terms: list[str]) -> dict[str, int]:

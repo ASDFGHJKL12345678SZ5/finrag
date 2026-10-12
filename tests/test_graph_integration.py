@@ -131,3 +131,40 @@ def test_拒答时检索链路仍然完整():
         assert "retrieve" in nodes and "verify" in nodes
 
     _run(body)
+
+
+def test_错年份问题被充分性守卫拒答():
+    """D13 R7：问 2024 年（语料只有 2025）——不带任何 mock 触发词，
+    旧实现会拿 2025 的数据硬答；守卫必须在生成前拒答。"""
+    async def body():
+        reports = await _reset_and_seed(10, 42)
+        company = reports[0].title.split("2025")[0]
+        final = await ask(f"{company}2024年的营业收入是多少？")
+        assert final["status"] == "insufficient"
+        assert final["refusal_reason"] == "year_not_in_evidence"
+
+    _run(body)
+
+
+def test_未来预测问题被充分性守卫拒答():
+    """问 2026 年且不含"预测"触发词——真实用户的时间错问形态。"""
+    async def body():
+        reports = await _reset_and_seed(10, 42)
+        company = reports[0].title.split("2025")[0]
+        final = await ask(f"{company}2026年的营业收入预计是多少？")
+        assert final["status"] == "insufficient"
+        assert final["refusal_reason"] == "year_not_in_evidence"
+
+    _run(body)
+
+
+def test_语料外指标被充分性守卫拒答():
+    """问市值——语料不覆盖该指标，正确行为是拒答而不是拿营业收入充当。"""
+    async def body():
+        reports = await _reset_and_seed(10, 42)
+        company = reports[0].title.split("2025")[0]
+        final = await ask(f"{company}2025年的总市值是多少？")
+        assert final["status"] == "insufficient"
+        assert final["refusal_reason"] == "metric_not_in_evidence"
+
+    _run(body)

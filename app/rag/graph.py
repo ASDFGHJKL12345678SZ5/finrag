@@ -42,12 +42,15 @@ _INDUSTRY_WORDS = ("新能源", "半导体", "医药生物", "食品饮料", "�
 class RAGState(TypedDict, total=False):
     question: str
     session_id: str
-    original_question: str  # 首轮原始问题：rewrite_query 改写时依托它重建，
+    original_question: str  # 首轮原始问题：rewrite_query 改写时依托它重建，
     industry: str | None
     retrieved: list[dict]
     answer: str
     verdicts: list[dict]
     status: str                 # running | insufficient | done | failed
+    refusal_reason: str         # 拒答归因（retrieval_empty/year_not_in_evidence/
+    #                            metric_not_in_evidence）——必须声明进 schema，
+    #                            否则 LangGraph 会当未知键过滤掉，调用方拿不到
     retry_count: int
     # Annotated + operator.add：trace 是累积 channel，否则每个节点的
     # trace 增量会互相覆盖，最终只剩最后一步（排查询链路时抓瞎）
@@ -90,9 +93,9 @@ async def generate(state: RAGState) -> dict:
     started = time.perf_counter()
     chunks = state.get("retrieved") or []
     prompt = _build_prompt(state["question"], chunks)
-    # asyncio.to_thread：OpenAI SDK 是同步阻塞调用，直接 await 会冻结
-    # 整个事件循环（真实模式下一次挂起 = 所有并发请求排队至多 60s）。
-    answer = await asyncio.to_thread(get_llm().generate, prompt)
+    # asyncio.to_thread：OpenAI SDK 是同步阻塞调用，直接 await 会冻结
+    # 整个事件循环（真实模式下一次挂起 = 所有并发请求排队至多 60s）。
+    answer = await asyncio.to_thread(get_llm().generate, prompt)
     return {
         "answer": answer,
         "trace": [_step("generate", started, answer_len=len(answer))],
@@ -102,19 +105,39 @@ async def generate(state: RAGState) -> dict:
 async def verify(state: RAGState) -> dict:
     """引用校验：数字论断必须能在被引 chunk 里找到依据。"""
     started = time.perf_counter()
-    chunks = state.get("retrieved") or []
-    # 空检索守卫：一条证据都没有时直接判 insufficient（断言的拒答边界）。
-    # 之前 verify_answer 对"检索结果中没有相关资料，无法回答。"这种纯定性
-    # 兜底文案会放行（无数字论断 -> passed），空库部署下全部问答 status=done，
-    # "拒答"只剩话术没有终态。注意：qualitative hallucination（有检索证据但
-    # 答案是定性猜测）仍会放行——那是 verify.py 文档化的已知能力边界。
-    if not chunks:
-        return {
-            "verdicts": [],
-            "status": "insufficient",
-            "refusal_reason": "retrieval_empty",
-            "trace": [_step("verify", started, passed=False, reason="retrieval_empty")],
-        }
+    chunks = state.get("retrieved") or []
+    # 空检索守卫：一条证据都没有时直接判 insufficient（断言的拒答边界）。
+    # 之前 verify_answer 对"检索结果中没有相关资料，无法回答。"这种纯定性
+    # 兜底文案会放行（无数字论断 -> passed），空库部署下全部问答 status=done，
+    # "拒答"只剩话术没有终态。注意：qualitative hallucination（有检索证据但
+    # 答案是定性猜测）仍会放行——那是 verify.py 文档化的已知能力边界。
+    if not chunks:
+        return {
+            "verdicts": [],
+            "status": "insufficient",
+            "refusal_reason": "retrieval_empty",
+            "trace": [_step("verify", started, passed=False, reason="retrieval_empty")],
+        }
+    # 证据充分性守卫（D13）：问题问到的年份/指标证据里不存在 -> 不生成直接拒。
+    # 真实模式下"预测类"问题模型嘴上拒答但 status=done（拒答率 0.1 的根因）——
+    # 这一层在生成前把"语料没有答案"的问题挡掉，确定性判据、零 LLM 成本。
+    from app.rag.sufficiency import check_sufficiency
+
+    refusal_reason = check_sufficiency(state.get("question", ""), chunks)
+    if refusal_reason:
+        log.info(
+            "graph.sufficiency_refusal",
+            extra={"context": {
+                "reason": refusal_reason,
+                "question": state.get("question", "")[:50],
+            }},
+        )
+        return {
+            "verdicts": [],
+            "status": "insufficient",
+            "refusal_reason": refusal_reason,
+            "trace": [_step("verify", started, passed=False, reason=refusal_reason)],
+        }
     chunks = state.get("retrieved") or []
     passed, ratio, verdicts = verify_answer(state.get("answer", ""), chunks)
     verdict_dicts = [
@@ -160,10 +183,10 @@ def rewrite_query(state: RAGState) -> dict:
             if _NUM_RE.match(term) or re.fullmatch(r"[一-龥]{2,}", term):
                 missing.append(term)
     # 上一轮改写过的查询只取主干（第一个空格前的原始问题）
-    # 依托 original_question 重建：早期版取 question.split(" ")[0] 会把
-    # "What is 宁德润能 2025 revenue?" 截成 "What"——中文无空格所以
-    # 36 个测试和全中文评测都没暴露，中英混合提问重试必残。
-    base = state.get("original_question") or state["question"]
+    # 依托 original_question 重建：早期版取 question.split(" ")[0] 会把
+    # "What is 宁德润能 2025 revenue?" 截成 "What"——中文无空格所以
+    # 36 个测试和全中文评测都没暴露，中英混合提问重试必残。
+    base = state.get("original_question") or state["question"]
     rewritten = (
         base + " " + " ".join(dict.fromkeys(missing)) if missing else base + " 详细数据"
     )
@@ -214,12 +237,12 @@ async def ask(question: str, session_id: str = "default") -> dict:
     if _graph is None:
         _graph = build_rag_graph()
     final = await _graph.ainvoke(
-        {
-            "question": question,
-            "session_id": session_id,
-            "original_question": question,
-            "status": "running",
-            "retry_count": 0,
-        }
+        {
+            "question": question,
+            "session_id": session_id,
+            "original_question": question,
+            "status": "running",
+            "retry_count": 0,
+        }
     )
     return final

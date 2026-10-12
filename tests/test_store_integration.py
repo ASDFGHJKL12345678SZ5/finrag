@@ -88,3 +88,23 @@ def test_按行业过滤只返回该行业文档():
         assert got <= expect, "过滤结果必须全部来自该行业的文档"
 
     _run_with_store(body)
+
+
+def test_company_names解析全部公司且互不为子串():
+    """实体锚定的输入源：从 documents.source 解析公司名。
+
+    互不为子串是锚定正确性前提（detect_anchor 最长匹配 + fuse 包含判断
+    都依赖它）——语料不变量在库里的落地验证。
+    """
+    async def body():
+        await _reset_and_seed(8, 99)
+        names = await store.company_names()
+        assert len(names) == len(set(names)) >= 8
+        for a in names:
+            for b in names:
+                if a != b:
+                    assert a not in b and b not in a, f"公司名互为子串: {a} / {b}"
+        # 缓存路径：二次调用应拿到同一份（TTL 内不查库）
+        assert await store.company_names() == names
+
+    _run_with_store(body)

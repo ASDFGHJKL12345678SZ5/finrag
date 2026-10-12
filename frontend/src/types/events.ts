@@ -33,6 +33,10 @@ export interface AnswerDeltaEvent {
 export interface RefuseEvent {
   event: 'refuse'
   reason: string
+  // D13：确定性拒答归因码（retrieval_empty / year_not_in_evidence /
+  // metric_not_in_evidence），空串=无归因（引用校验未通过）。可选字段，
+  // 旧后端不发也有——前端展示以 reason 为准，此字段供未来做分因展示。
+  refusal_reason?: string
   verdicts: Verdict[]
   answer?: string
   total_ms?: number

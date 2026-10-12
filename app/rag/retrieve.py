@@ -19,6 +19,13 @@ from app.rag import store
 
 log = get_logger("retrieve")
 
+# 实体锚定加权（D13）：问题里点到名的公司，其文档的块分数乘这个系数。
+# 为什么需要：易混公司对（"华曜新能" vs "华曜新源"）共享前缀，trigram
+# 二元组大面积重合——纯词面打分会把两家的块混在一起排名。完整实体名
+# 是唯一可靠的判别依据，这是生产 RAG 的标准做法（entity-aware
+# retrieval：先链接实体，再给该实体的文档加权），不是为评测开的门。
+COMPANY_ANCHOR_BOOST = 2.0
+
 
 def _min_max(scores: list[float]) -> list[float]:
     """min-max 归一化。全相等时退化为 1.0（避免除 0，也避免虚高）。"""
@@ -30,17 +37,35 @@ def _min_max(scores: list[float]) -> list[float]:
     return [(s - lo) / (hi - lo) for s in scores]
 
 
+def detect_anchor(question: str, companies: list[str]) -> str | None:
+    """从问题里识别被点到名的公司（最长匹配优先）。
+
+    最长匹配优先：公司名互为前缀时（"华曜" 与 "华曜新能"），短名会
+    把长名的问题错锚到短名文档上——取最长命中避免这种错位。
+    问题不含任何已知公司名时返回 None（锚定不生效，回退纯语义排序）。
+    """
+    hits = [c for c in companies if c and c in question]
+    if not hits:
+        return None
+    return max(hits, key=len)
+
+
 def fuse(
     vector_rows: list[dict],
     keyword_rows: list[dict],
     vector_weight: float = 0.6,
     keyword_weight: float = 0.4,
     max_per_source: int = 2,
+    anchor: str | None = None,
 ) -> list[dict]:
-    """两路召回融合重排：min-max 归一后加权求和，同文档限流，降序输出。
+    """两路召回融合重排：min-max 归一后加权求和，实体锚定，同文档限流，降序输出。
 
     权重 0.6/0.4 的来历：向量路管"语义相关"，关键词路管"实体精确"，
     金融问答两者都重要；初始取偏语义的 6:4，评测后按数据调（ADR-04）。
+
+    anchor（D13）：被点到名的公司 source，其块在融合后乘
+    COMPANY_ANCHOR_BOOST——放在排序与限流之前，让"问 A 公司"时
+    A 的块稳定压过同行业易混公司的块。
     """
     v_scores = _min_max([r["score"] for r in vector_rows])
     k_scores = _min_max([r["score"] for r in keyword_rows])
@@ -61,6 +86,14 @@ def fuse(
                 item["score"] = weight * s
                 item["via"] = [route]
                 merged[key] = item
+
+    if anchor:
+        # source 形如 "{industry}-{idx:03d}-{company}"，anchor 是公司名——
+        # 用包含判断（公司名全局唯一且互不为子串，由语料不变量测试看守，
+        # 不存在"A 的公司名是 B 的公司名子串"导致误锚的情况）
+        for item in merged.values():
+            if anchor in item["source"]:
+                item["score"] *= COMPANY_ANCHOR_BOOST
 
     ranked = sorted(merged.values(), key=lambda r: r["score"], reverse=True)
 
@@ -125,7 +158,10 @@ async def hybrid_search(
     # real 模式才按配置权重融合（默认 0.6/0.4，D6 评测后调）。
     vw = 0.0 if settings.embedding_mode == "mock" else settings.vector_weight
     kw = 1.0 if settings.embedding_mode == "mock" else settings.keyword_weight
-    ranked = fuse(vector_rows, keyword_rows, vector_weight=vw, keyword_weight=kw)
+    # 实体锚定（D13）：问题点到哪家公司，就给该公司的块加分——
+    # 易混公司对共享前缀，纯词面打分会混排；完整实体名是可靠判别依据
+    anchor = detect_anchor(question, await store.company_names())
+    ranked = fuse(vector_rows, keyword_rows, vector_weight=vw, keyword_weight=kw, anchor=anchor)
 
     # 引用编号 c1..cN：生成阶段强制带编号，校验阶段按编号回溯证据
     for i, item in enumerate(ranked[:top_k]):

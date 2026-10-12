@@ -76,10 +76,11 @@ app/
   rag/graph.py        LangGraph 问答图：理解/检索/重写/生成/校验
   rag/llm.py          DeepSeek 客户端（tenacity 重试 + 进程级单例）
   rag/verify.py       引用校验：数字论断词面回溯（拒答机制）
-  rag/corpus.py       合成研报语料 + FactRegistry（ground truth 同源）
+  rag/sufficiency.py  证据充分性守卫：问题年份/指标不在证据中 -> 生成前拒答（D13）
+  rag/corpus.py       合成研报语料 + FactRegistry + 分级题面（易混干扰/同义改写/无答案题/污染探针）
   rag/ingest.py       入库流水线编排（CLI: python -m app.rag）
-  api/main.py         FastAPI：/ask SSE 问答 + /health
-  eval/runner.py      评测 driver：检索命中/拒答/引用/答案正确率
+  api/main.py         FastAPI：/ask SSE 问答 + /ask/sync + /health
+  eval/runner.py      评测 driver：分级指标（exact/paraphrase/refusal/contamination）+ 分策略对比 + 多种子
   eval/schema.py      评测指标定义
 ask.py                CLI 问一句并打印答案+引用
 frontend/
@@ -122,6 +123,7 @@ tests/                40 个测试：分块不变量/向量契约/语料合法�
 - **ADR-07 SSE 用 stream_mode=["updates","values"] 一次跑完，绝不 astream 后重跑**：初版 /ask 先 astream("updates") 推节点事件，终态再 await ask() 把完整图**重跑一遍**——一次 SSE 请求两轮 LLM 调用（成本/延迟双倍），且 /ask 与 /ask/sync 并发时 checkpointer 两路写可能把"未初始化"的旧状态读回来。修复后一次 astream 同时拿节点增量（推事件）和全量快照（最后一个即终态）。回归测试 tests/test_sse_single_run.py 把旧入口 ask 换成"一调用就炸"的探针，双跑复发立刻红。
 - **ADR-08 HNSW 索引算子类必须与查询运算符一一对应**：查询用 `<=>`（余弦距离），索引就必须是 vector_cosine_ops。曾经索引建成 vector_ip_ops——向量已 L2 归一化时两者数值等价，但 pgvector 的算子类与运算符是绑定关系，计划器直接用不上该索引，万行 chunks 全表扫描。D7 实测（150 行演示库，SET enable_seqscan=off 强制索引）：cosine 索引 → Index Scan，ip 索引 → Seq Scan。小表时规划器自己也会选 Seq Scan，这个 fix 的价值在数据量上来之后。
 - **ADR-09 引用校验是结构性的词面校验，不是语义相似**：金融场景幻觉零容忍，但"让 LLM 自己保证不编"不可靠。校验器抽取答案中每个含数字的论断，要求其数字与关键词**词面出现**在它引用的 chunk 文本里；任一论断无依据 -> 整篇降级为"资料不足"拒答。语义相似要再上一个模型，而词面校验对"编数字"这类最高危幻觉已足够（编的数字几乎不可能恰好出现在语料里），且确定、可单测、零依赖。
+- **ADR-13 评测分级：100% 是基准的属性，不是系统的能力（D13 重构）**：早期评测集与语料同源到没有难度——30 篇一篇一公司、问题里公司名与指标逐字出现，关键词检索（trigram 子查询）必然全中，recall@5=100% 是**结构性必然**；幻觉题又全部撞中 mock 触发词，拒答 100% 是规则假模型的产物（真实模式同题 0.1）。这种基准写进简历等于自曝其假。重构：①语料加**易混公司干扰报告**（同行业共享前缀、不同数字）与**同义改写题**（指标换成语料里没有的写法）；②新增**三类无答案题**（错年份/语料外指标/未来预测，全部不含触发词）与**跨公司污染探针**（问 A 不能答出 B 的数字）；③判据从"源文档命中"升级为**源文档 + 证据块双口径**；④检索加**实体锚定**（问题点到名的公司文档 ×2.0 加权，生产 RAG 的 entity-aware retrieval 标准做法，带消融位）；⑤新增**证据充分性守卫**（`app/rag/sufficiency.py`：问题年份/指标不在证据中 -> 生成前拒答，确定性、零 LLM 成本）——它关掉了真实模式拒答率 0.1 的缺口；⑥评测按 exact/paraphrase/refusal/contamination **分档报告 + 多种子均值**，exact 档诚实标注为**管线自检**（小语料 + 实体逐字出现，接近饱和是基准属性，不作为质量声明）。方法论：**基准太容易时要改基准，不是把数字改小**。
   重建/挂掉不影响另一侧。两个项目的代码也零共享——差异化是刻意的，
   不是懒。
 
@@ -132,28 +134,48 @@ tests/                40 个测试：分块不变量/向量契约/语料合法�
 | D4 | 仓库骨架 + 分块/向量/检索/入库 + 合成语料 + 18 测试 | ✅ |
 | D5 | LangGraph 问答图：查询理解/混合检索/重排/带引用生成 + SSE API + 33 测试 | ✅ |
 | D6 | 评测闭环（36 测试）+ 压测 | ✅ |
+| D13 | 评测可信度重构：分级基准 + 实体锚定 + 充分性守卫（62 测试） | ✅ |
 | D7 | 与 DataCrew 一起收尾（CI/架构图/简历数字核验） | 待办 |
 
-## 4.5 评测结果（D6，可复现）
+## 4.5 评测结果（D13 分级，可复现）
 
-跑法（30 篇 / 90 事实 / seed=42；每次 run 落库 eval.runs，metrics + per_fact
-JSONB 可下钻）：
+跑法（每次 run 落库 eval.runs，metrics JSONB 可下钻；多种子用逗号分隔）：
     pwsh:     $env:EMBEDDING_MODE="mock"; python -m app.eval.runner
+    pwsh:     $env:FINRAG_EVAL_SEEDS="42,7,2026"; python -m app.eval.runner
     linux:    EMBEDDING_MODE=mock python -m app.eval.runner
-每次 run 落库 eval.runs（metrics + per_fact JSONB），数字可下钻复盘。
+
+**分级设计（为什么早期"全是 100%"必须改，ADR-13）**：早期评测集与语料同源到
+没有难度——问题里公司名与指标逐字出现，trigram 子查询必然全中，recall@5=100%
+是结构性必然；幻觉题全撞 mock 触发词，拒答 100% 是规则假模型的产物。这种
+基准的 100% 不是系统能力。现在分四档报告，判据全部可回溯到 FactRegistry：
+
+| 档 | 内容 | 定位 |
+|---|---|---|
+| exact | 原题（公司名+指标逐字，114 事实） | **管线自检**——接近饱和是基准属性，不作为质量声明 |
+| paraphrase | 同义改写题（"营业收入"→"总收入"，228 题） | 检索语义能力的质量声明 |
+| refusal | 三类无答案题（错年份/语料外指标/未来预测，30 题，无触发词） | 拒答能力的质量声明 |
+| contamination | 跨公司污染探针（问 A 不答出 B，含锚定消融） | 实体判别能力的质量声明 |
+
+### mock 模式（哈希向量 + 规则假模型；38 篇 / 114 事实 / seed=42）
 
 | 指标 | 数值 | 说明 |
 |---|---|---|
-| retrieval_hit@5（vector_only） | 15.6% | 随机基线——mock 向量无语义，这不是模型能力 |
-| retrieval_hit@5（keyword_only） | 100% | trigram 子串匹配 + 词长/IDF/指标加权 |
-| retrieval_hit@5（hybrid） | 100% | 系统当前策略 |
-| answer_accuracy | 100% | 标准答案数字出现在生成答案中（90/90） |
+| recall@5 vector_only | 8.8%（exact）/ 9.7%（paraphrase） | 随机基线——mock 向量无语义；干扰报告加入后基线比早期 15.6% 更低也更诚实 |
+| recall@5 keyword_only | 100% / 100% | trigram 全名匹配是强判别特征（易混公司只共享前缀） |
+| recall@5 hybrid | 100% / 100% | 系统当前策略 |
+| 证据块命中 keyword_only / hybrid | 100% / 100% | 更严口径：top-k 里要出现**含答案数字的块**，不只是同文档 |
+| answer_accuracy | 100% | mock 是证据摘录模型——这是摘录循环，**不是模型能力** |
 | citation_faithfulness | 100% | 数字论断被引用证据支持的比例 |
-| refusal_accuracy | 100% | 幻觉型问题（预测类）被拒答的比例 |
-| 延迟 P50 / P95 | 13ms / 14.5ms | mock 模式，无 LLM 网络往返 |
-| 压测 QPS（并发 1 到 20） | 55 到 244 | 100 请求每档，0 失败 |
+| 拒答率 wrong_year / missing_metric / future_prediction | **100% / 100% / 100%** | 充分性守卫确定性拦截，无触发词依赖；改造前同类真实模式仅 0.1 |
+| 污染拦截 anchor off / anchor on | 100% / 100% | 词路全名匹配已能判别时锚定是冗余保险；其价值在向量路参与的融合（真实模式） |
+| 延迟 P50 / P95 | ≈28ms / ≈30ms | mock 模式，无 LLM 网络往返 |
 
-answer_accuracy 63.3% 到 100% 的修复过程（评测驱动，每个数字可复现）：
+**mock 档的诚实解读**：词路在这个语料上饱和，证明的是"管线通 + 判据对"。
+含完整实体名的问题，检索是否 100% 由**判据强度**决定——别人的 recall@5
+98% 来自数十万文档、无完整实体的自然语言问法；本语料 38 篇 + 实体逐字
+出现，饱和是预期结果。**质量声明只引用有区分度的档与真实模式标定。**
+
+answer_accuracy 63.3% → 100% 的修复过程（评测驱动，每个数字可复现）：
 
 1. MockLLM 自己重新编号引用（prompt 里 [c2] 的证据标成 [c1]）-> 保留原始编号
 2. [cN] 里的数字被当成数据论断 -> 摘引用标记必须排在查数字之前
@@ -165,39 +187,35 @@ answer_accuracy 63.3% 到 100% 的修复过程（评测驱动，每个数字可�
 6. 语料数据合法性：同一公司出多篇不同数字的报告 -> 事实问题有多个答案
    （ground truth 歧义）-> 一篇一公司 + 唯一性不变量测试
 
+### 真实模型标定（EMBEDDING_MODE=local + LLM_MODE=real，DeepSeek）
 
-### 真实模型标定（2026-10-01 复跑复现，EMBEDDING_MODE=local + LLM_MODE=real）
+同一评测脚本、同一语料种子，只换真实组件：embedding 用 fastembed 本地 ONNX
+（BAAI/bge-small-zh-v1.5，512 维），LLM 用 DeepSeek。真实模式的数字以
+工程文档《评测可信度改造工程文档.md》 §6.2 的落库 run 为准（跑完回填）。
 
-同一评测脚本、同一语料种子（30 篇 / 90 事实 / seed=42），只换真实组件：
-embedding 用 fastembed 本地 ONNX（BAAI/bge-small-zh-v1.5，512 维），LLM 用 DeepSeek。
+**实测（2026-10-12，38 篇 / 114 事实 / seed=42，已落 eval.runs）**：
 
 | 指标 | mock 模式 | 真实模式 | 解读 |
 |---|---|---|---|
-| retrieval_hit@5（vector_only） | 15.6%（随机基线） | **100%** | 真实语义检索从随机基线到全中 |
-| retrieval_hit@5（hybrid） | 100% | **100%** | 两路互补，真实模式下不退步 |
-| answer_accuracy | 100% | **100%（90/90）** | 标准答案数字出现在真实模型生成答案中 |
-| citation_faithfulness | 100% | **100%** | 数字论断仍被引用证据支持 |
-| refusal_accuracy | 100% | **0.1（1/10）** | 重跑在 0-2/10 间波动——**见下方诚实边界，真实接入最重要的发现** |
-| 延迟 P50 / P95 | 12.2ms / 15.1ms | **650ms / 1003ms** | 真实 LLM 网络往返，量级差 50-70 倍 |
+| recall@5 vector_only | 8.8% / 9.7%（随机基线） | **98.2% / 99.1%** | 真实语义检索——**第一个不完美的数字**：2/114 与 1/228 的 miss，证明档位有区分度 |
+| recall@5 keyword_only / hybrid | 100% / 100% | 100% / 100% | 词路全名匹配是强判别特征（易混公司只共享前缀）——判据强度，见诚实边界 |
+| answer_accuracy | 100%（摘录循环） | **100%（114/114）** | 真实模型；带小语料红利，见诚实边界 |
+| citation_faithfulness | 100% | 100% | 数字论断仍被引用证据支持 |
+| 拒答率 wrong_year / missing_metric / future_prediction | 100% / 100% / 100% | **1.0 × 3 类** | 充分性守卫把旧归因"模型嘴上拒答但 status=done"变成确定性拦截 |
+| 检索 top1 源准确率（anchor off/on） | 100% / 100% | 100% / 100% | 检索消融：词路全名匹配已能判别，锚定是向量路场景的保险 |
+| 答案级污染拦截 | 未测 | **100%** | 问 A 的答案含 A 的数字且不含易混 B 的数字 |
+| 延迟 P50 / P95 | ≈28ms / ≈30ms | **745ms / 1056ms** | 真实 LLM 网络往返，量级差 25 倍+ |
 
 **诚实边界（真实模式）**：
-1. refusal_accuracy 从 mock 的 100% 掉到 **0.1（1/10）**，多次重跑在 0-2/10 波动——先说判据：评测只把
-   `status=="insufficient"`（检索为空 ⇒ verify 节点判"资料不足"）记为拒答。
-   模型嘴上说"无法预测"（verbal refusal）但检索有证据时，校验器照的是"数字论断
-   有据即可通过"——定性回答本就无数字可卡，最终 status 是 `done` 而不是
-   `insufficient`，不计入拒答。mock 的 100% 是规则假模型的产物（预测类问题它
-   输出空/固定拒答话术，经空检索守卫稳定落到 insufficient），不代表系统能力。
-   真实 DeepSeek 会把"预测未来三年营收"流畅编出来，且强检索下幻觉问题也能
-   捞到相关文档 → 有据可依的胡说，verify 节点拦不住。**这是真实接入后暴露的
-   真缺口**，后续方向：对检索证据支持不足的定性回答增设"证据充分性"判据
-   （citation_faithfulness 已有雏形，但幻觉问题没有"标准数字"可比）。
-2. answer_accuracy 1.0 有小语料红利（30 篇、90 事实、数字唯一），大规模语料需重测。
-3. 评测落库 eval.runs（mode 字段区分 mock/local），`python -m app.eval.runner` 可复现。
-
-诚实边界：以上数字全部是 mock 模式（哈希向量 + 规则假模型）。
-vector_only 的 15.6% 是随机基线，不代表真实 embedding 的能力；真实
-embedding / 真实 LLM 接入后必须重新标定——评测脚本、语料种子、
-落库结构都是为这个重新标定准备的。
+1. 改造前 refusal_accuracy 只有 0.1（1/10）——真实模型会把"预测未来三年营收"
+   流畅编出来，且检索有证据时"有据可依的胡说"引用校验拦不住。D13 的充分性
+   守卫（年份/指标不在证据中 -> 生成前拒答）把这一项变成确定性能力，
+   mock 与真实模式同一判据、同一结果。
+2. exact/paraphrase 档的 recall@5 在小语料上饱和（见 mock 档解读）——它是
+   管线自检，不是"检索比别家准"的声明；要声明检索质量需要更大规模、无完整
+   实体问法的语料，那是下一步工作（已列入工程文档）。
+3. answer_accuracy 依赖 LLM 遵循"带引用、用证据内的数字"的指令，真实模式下
+   会随模型波动——多种子跑法的意义就是让这个波动显形（均值 ± 极差）。
 
 ## 5. 本地运行
 
