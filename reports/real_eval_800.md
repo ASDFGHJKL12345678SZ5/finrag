@@ -33,7 +33,7 @@ LLM_MODE=real EMBEDDING_MODE=local python -m app.eval.runner \
 |---|---|---|
 | yoy（同比） | 40/40 | — |
 | yoy_diff（两年差） | 20/20 | — |
-| segment_share（分业务占比） | 14/20 | 答案算对但引用块里没有该百分比，校验判 insufficient |
+| segment_share（分业务占比，**表格题**） | 14/20 | 答案算对但引用块里没有该百分比，校验判 insufficient；检索与证据命中均 20/20 |
 | industry_max（行业最高营收） | 3/20 | 单文档 RAG 无法跨 40 家公司 argmax；3 题靠检索恰好捞到赢家 |
 
 ### 检索（hybrid，top-5）
