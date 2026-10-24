@@ -49,9 +49,12 @@ QUESTIONS = [
 ]
 
 
-async def _one(client: httpx.AsyncClient, q: str, sem: asyncio.Semaphore) -> tuple[float, bool]:
+async def _one(
+    client: httpx.AsyncClient, q: str, sem: asyncio.Semaphore
+) -> tuple[float, bool, str]:
     async with sem:
         started = time.perf_counter()
+        path = "error"
         try:
             r = await client.post(
                 BASE + "/ask/sync",
@@ -60,9 +63,24 @@ async def _one(client: httpx.AsyncClient, q: str, sem: asyncio.Semaphore) -> tup
                 timeout=120,
             )
             ok = r.status_code == 200 and r.json().get("status") in ("done", "insufficient")
+            if r.status_code == 200:
+                data = r.json()
+                nodes = {t.get("node") for t in (data.get("trace") or [])}
+                if data.get("status") == "insufficient":
+                    path = "refused"
+                elif "aggregate" in nodes:
+                    path = "aggregate"
+                else:
+                    path = "llm_generate"
         except Exception:  # noqa: BLE001 - 压测里任何异常都算失败，不能中断整轮
             ok = False
-        return (time.perf_counter() - started) * 1000, ok
+        return (time.perf_counter() - started) * 1000, ok, path
+
+
+def _pct(lat: list[float], q: float) -> float:
+    if not lat:
+        return 0.0
+    return round(lat[min(int(len(lat) * q), len(lat) - 1)], 1)
 
 
 async def run(concurrency: int, total: int) -> dict:
@@ -76,6 +94,16 @@ async def run(concurrency: int, total: int) -> dict:
         wall_s = time.perf_counter() - started
     lat = sorted(r[0] for r in results)
     ok_n = sum(1 for r in results if r[1])
+    paths: dict[str, dict] = {}
+    for name in ("llm_generate", "refused", "aggregate", "error"):
+        subset = [r for r in results if r[2] == name]
+        lats = sorted(r[0] for r in subset)
+        paths[name] = {
+            "n": len(subset),
+            "p50_ms": round(statistics.median(lats), 1) if lats else 0.0,
+            "p95_ms": _pct(lats, 0.95),
+            "ok": sum(1 for r in subset if r[1]),
+        }
     return {
         "concurrency": concurrency,
         "total": total,
@@ -85,8 +113,9 @@ async def run(concurrency: int, total: int) -> dict:
         "wall_s": round(wall_s, 2),
         "qps": round(total / wall_s, 1) if wall_s else 0,
         "p50_ms": round(statistics.median(lat), 1),
-        "p95_ms": round(lat[min(int(len(lat) * 0.95), len(lat) - 1)], 1),
+        "p95_ms": _pct(lat, 0.95),
         "max_ms": round(lat[-1], 1),
+        "paths": paths,
     }
 
 
@@ -105,6 +134,13 @@ def main() -> None:
             f"Max {row['max_ms']:>8}ms | 错误率 {row['error_rate']:.1%} "
             f"| 墙钟 {row['wall_s']}s"
         )
+        for name, stat in row["paths"].items():
+            if not stat["n"]:
+                continue
+            print(
+                f"      {name:<13} n={stat['n']:>3}  P50 {stat['p50_ms']:>7}ms"
+                f"  P95 {stat['p95_ms']:>7}ms  ok={stat['ok']}/{stat['n']}"
+            )
 
 
 if __name__ == "__main__":

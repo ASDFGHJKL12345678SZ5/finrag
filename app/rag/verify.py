@@ -25,6 +25,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from app.rag.metric_lexicon import METRIC_GROUPS
+
 # 数字 + 可选单位。前后都排除数字/小数点：5 不能命中 56.4，20 不能命中 2025。
 _NUM = re.compile(
     r"(?<![\d.])(\d+(?:\.\d+)?)(?:\s*(亿元|亿|万元|万|元|%))?(?![\d.])"
@@ -89,18 +91,30 @@ def split_claims(answer: str) -> list[tuple[str, str]]:
     return claims
 
 
-def repair_citations(answer: str, chunks: list[dict]) -> str:
-    """把"引用错块"的论断自动改引到真正含该数字的块（FR-10）。
+def _source_company(chunk: dict) -> str | None:
+    source = chunk.get("source") or ""
+    parts = source.split("-")
+    return parts[2] if len(parts) >= 3 else None
 
-    真实模式实测：分业务占比题模型算对了 23.45%，却引用了多年营收表 c2
-    （只有总营收），而含"占比 23.45%"的分业务表 c1 就在 retrieved 里——
-    校验按"被引块"判，于是正确答案被拒。这里做确定性修复：
-    逐句检查，若论断在已引块里无据、但在**另一条 retrieved 块**里有据，
-    就给该句补上那块引用。只补引用、不改数字/文字；找不到就原样返回
-    （绝不为了过校验而放宽判据）。
+
+def _metric_terms_in(claim: str) -> list[str]:
+    return [s for group in METRIC_GROUPS.values() for s in group if s in claim]
+
+
+def repair_citations(
+    answer: str, chunks: list[dict], entities: set[str] | None = None
+) -> str:
+    """把"引用错块"的论断自动改引到真正含该数字的块（FR-10 / RW-5）。
+
+    RW-5 收紧：候选块必须同时满足
+    1. 属于论断/答案里提到的公司（source 解析出的简称在 entities 里）；
+    2. 含论断里的指标词（METRIC_GROUPS 说法）。
+    这样避免"数字碰巧相同但公司不同"的块被拿来修复、再自证忠实度。
+    找不到就原样返回，绝不为了过校验放宽判据。
     """
     if not answer or not chunks:
         return answer
+    entities = entities or set()
     by_id = {c.get("citation_id"): c for c in chunks if c.get("citation_id")}
     parts = re.split(r"(?<=[。；;\n])", answer)
     repaired: list[str] = []
@@ -115,10 +129,13 @@ def repair_citations(answer: str, chunks: list[dict]) -> str:
         if evidence and not _missing_evidence(claim, evidence):
             repaired.append(segment)
             continue
+        metric_terms = _metric_terms_in(claim)
         candidate = next(
             (
                 c for c in chunks
                 if c.get("citation_id") not in cited
+                and (not entities or _source_company(c) in entities)
+                and (not metric_terms or any(t in c["text"] for t in metric_terms))
                 and not _missing_evidence(claim, c["text"])
             ),
             None,

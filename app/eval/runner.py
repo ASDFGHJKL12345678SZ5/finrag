@@ -255,6 +255,8 @@ async def run_eval(
         cat: {"n": 0, "refused": 0} for cat in ANSWER_CATEGORIES
     }
     faith = {"supported": 0, "total": 0}
+    pre_faith: list[float] = []
+    repaired = 0
     oracle_cache: dict[str, list[dict]] = {}
     latencies: list[float] = []
     records: list[dict] = []
@@ -317,10 +319,21 @@ async def run_eval(
                 )
                 faith["supported"] += sum(1 for v in verdicts if v.supported)
                 faith["total"] += len(verdicts)
+                verify_step = next(
+                    (t for t in final.get("trace") or []
+                     if t.get("node") == "verify"), {}
+                )
+                detail = verify_step.get("detail") or {}
+                if "pre_ratio" in detail:
+                    pre_faith.append(float(detail["pre_ratio"]))
+                if detail.get("citation_repaired"):
+                    repaired += 1
                 record.update({
                     "answer": got,
                     "status": final.get("status"),
                     "answer_ok": ok,
+                    "citation_pre_ratio": detail.get("pre_ratio"),
+                    "citation_repaired": bool(detail.get("citation_repaired")),
                     "refusal_reason": final.get("refusal_reason"),
                     "verdicts": [
                         {"claim": v.claim, "supported": v.supported} for v in verdicts
@@ -419,6 +432,10 @@ async def run_eval(
         "overall_accuracy": overall,
         "guard_false_reject": guard_false_reject,
         "citation_faithfulness": _rate(faith["supported"], faith["total"]),
+        "citation_faithfulness_before": (
+            round(sum(pre_faith) / len(pre_faith), 4) if pre_faith else 0.0
+        ),
+        "citation_repair_rate": _rate(repaired, answerable_n),
         "latency_ms": {
             "p50": round(statistics.median(latencies), 1) if latencies else 0.0,
             "p95": round(latencies[min(int(len(latencies) * 0.95), len(latencies) - 1)], 1)
@@ -563,6 +580,10 @@ def main() -> None:
                    _collect(runs, ("guard_false_reject", "calculation")), seeds))
     print(_fmt_row("citation_faithfulness",
                    _collect(runs, ("citation_faithfulness",)), seeds))
+    print(_fmt_row("citation_faithfulness_before",
+                   _collect(runs, ("citation_faithfulness_before",)), seeds))
+    print(_fmt_row("citation_repair_rate",
+                   _collect(runs, ("citation_repair_rate",)), seeds))
     print(_fmt_row("overall_accuracy", _collect(runs, ("overall_accuracy",)), seeds))
     print(_fmt_raw("P95 延迟", _collect(runs, ("latency_ms", "p95")), seeds, "ms"))
     print("-" * 78)

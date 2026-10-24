@@ -223,9 +223,17 @@ async def verify(state: RAGState) -> dict:
     # 证据充分性守卫（D13）已上移到 check_sufficiency 节点（生成之前）——
     # 见 graph 模块 docstring 与 test_sufficiency_refusal_skips_generate。
     # 本节点只负责"答案里的数字有没有编造"。
-    # 引用自动修复（FR-10）：数字在别的 retrieved 块里有据、但模型引错块时，
+    # 引用自动修复（FR-10 / RW-5）：数字在别的 retrieved 块里有据、但模型引错块时，
     # 给该句补上正确引用；只补引用不改数字，修不好仍按原判据拒答。
-    answer = repair_citations(state.get("answer", ""), chunks)
+    # RW-5：只允许修到“同公司 + 同指标”的块，避免数字巧合跨公司自证。
+    raw_answer = state.get("answer", "")
+    companies = {
+        c["source"].split("-")[2] for c in chunks
+        if c.get("source") and c["source"].count("-") >= 2
+    }
+    entities = {company for company in companies if company in raw_answer}
+    answer = repair_citations(raw_answer, chunks, entities=entities)
+    _pre_passed, pre_ratio, _pre_verdicts = verify_answer(raw_answer, chunks)
     passed, ratio, verdicts = verify_answer(answer, chunks)
     verdict_dicts = [
         {"claim": v.claim, "citation_id": v.citation_id,
@@ -246,7 +254,9 @@ async def verify(state: RAGState) -> dict:
         "trace": [_step(
             "verify", started,
             passed=passed, ratio=round(ratio, 3), claims=len(verdict_dicts),
-            citation_repaired=answer != state.get("answer", ""),
+            pre_ratio=round(pre_ratio, 3),
+            citation_repaired=answer != raw_answer,
+            repair_entities=sorted(entities),
         )],
     }
 

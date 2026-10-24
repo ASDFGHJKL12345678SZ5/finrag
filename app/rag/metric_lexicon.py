@@ -1,16 +1,19 @@
-"""金融指标同义词典（独立于出题代码的判据来源）。
+"""金融指标形态识别（独立于出题代码的判据来源）。
 
-为什么单独成模块（FR-2）：旧版守卫从 `app.rag.corpus` 导入
-`UNSUPPORTED_METRICS / WRONG_YEARS`——出题代码知道答案，守卫也用出题代码的
-清单判断题，拒答 100% 是**循环论证**。本模块只描述"金融文本里同一个指标
-有哪些常见说法"，不包含任何题目、答案或语料事实；评测集可以换、语料可以换，
-守卫判据不变。
+FR-2 旧版用一张“不支持的指标清单”（市值/股息率/…）判拒答；RW-3 返工：
+清单是穷举的，语料外指标换个说法（ROE/资产负债率/员工人数）就漏。
+现在改成**正向白名单 + 指标形态**：
+- 支持的指标只来自 `METRIC_GROUPS`（canonical + 同义说法）；
+- 问题里出现“金融指标形态”（…率 / …额 / …比 / …数 / …量 / …天数 / 单价 /
+  ROE / 商誉 / 有息负债…）但不在白名单 → 判为不覆盖，拒答；
+- 未来问题用通用时间指向词（明年/未来/下一年度/接下来/会不会…）判定，
+  不再枚举出题模板。
 
-维护约定：
-- 新增语料指标时同步补 `METRIC_GROUPS`（canonical + synonyms）；
-- 判据只用"问题里的指标词是否出现在证据中"，不做语义推断，保持可解释。
+注意：本模块只描述金融文本的形态，不包含题目/答案/语料事实；评测集可以换。
 """
 from __future__ import annotations
+
+import re
 
 # canonical 指标 → 文本里可能出现的说法（含 canonical 本身）
 # 顺序有意义：先匹配到的组即 canonical，用于跨说法归一。
@@ -24,42 +27,34 @@ METRIC_GROUPS: dict[str, tuple[str, ...]] = {
     "订单量": ("订单量", "订单数量", "下单量"),
 }
 
-# 金融语料**明确不覆盖**的指标：问这些必须拒答，不许拿营收/利润充当答案。
-# 与 METRIC_GROUPS 分开：这些即使语料将来覆盖，也要先登记进 METRIC_GROUPS。
-UNSUPPORTED_METRICS: tuple[str, ...] = (
-    "市值",
-    "总市值",
-    "股息率",
-    "市盈率",
-    "市净率",
-    "股价",
-    "目标价",
-    "分红",
-    "每股股利",
-    "每股收益",
-    "PE",
-    "PB",
+_SUPPORTED_TERMS: set[str] = {
+    term for group in METRIC_GROUPS.values() for term in group
+} | set(METRIC_GROUPS)
+
+# 指标形态：…率/…额/…比/…数/…量/…天数/单价/杠杆/商誉/负债 + 英文缩写
+_METRIC_SHAPE = re.compile(
+    r"(?:[一-龥A-Za-z]{1,10}(?:收益率|周转率|负债率|毛利率|净利率|费用率|比率|率"
+    r"|额|比|数|量|天数|单价|杠杆)"
+    r"|ROE|ROA|ROIC|EPS|PE|PB|商誉|有息负债"
+    r"|总资产|净资产|总负债|总股本|总市值|流通市值|所有者权益"
+    r"|应收账款|存货|固定资产|市值|股价|目标价|分红|每股收益|每股股利)"
 )
 
-# 未来/预测类措辞：不带具体年份时也是无答案题（语料只有历史数据）
-FUTURE_MARKERS: tuple[str, ...] = (
-    "明年",
-    "后年",
-    "未来",
-    "预计",
-    "预测",
-    "展望",
-    "前景",
-    "将会",
-    "有望",
+# 这些是问句结构词/泛指标词，不是“问了一个未覆盖指标”
+_GENERIC_WORDS = {
+    "百分比", "占比", "比例", "比重", "数量", "金额", "总额", "余额",
+    "收入", "利润", "指标", "数据", "多少", "公司", "行业", "同比", "环比",
+}
+
+# 通用“时间指向未来”词：相对时间/预测语气，不枚举出题模板
+_FUTURE_RE = re.compile(
+    r"明年|后年|未来|下一年度?|接下来|今后|后续|来年|下一财年|中长期"
+    r"|走势|会不会|能否|预计|预测|展望|前景|将会|有望"
 )
 
 
 def metric_terms_in(text: str) -> list[tuple[str, tuple[str, ...]]]:
-    """问题里出现了哪些指标组：[(canonical, 该组在文本中出现的说法)]。
-
-    返回命中的组与命中词，供守卫生成可解释的拒答原因（"数据里没有毛利率"）。
-    """
+    """问题里出现了哪些**受支持**指标组：[(canonical, 命中说法)]。"""
     hits: list[tuple[str, tuple[str, ...]]] = []
     for canonical, synonyms in METRIC_GROUPS.items():
         found = tuple(s for s in synonyms if s in text)
@@ -69,13 +64,7 @@ def metric_terms_in(text: str) -> list[tuple[str, tuple[str, ...]]]:
 
 
 def expand_metric_terms(text: str) -> list[str]:
-    """把问题里的指标说法扩成该组的全部词（FR-1 检索用）。
-
-    为什么需要：语料正文写"营业收入"，问题可能写"营收/总收入/收入总额"。
-    BM25 是字面匹配，"营收"并不是"营业收入"的连续子串——不扩词就会捞到
-    同公司的现金流块（实体命中、指标没命中），答案错得"有据可依"。
-    只扩**问题里已出现的指标组**，不做整句改写，避免引入无关词。
-    """
+    """把问题里的指标说法扩成该组的全部词（检索用）。"""
     out: list[str] = []
     for canonical, synonyms in METRIC_GROUPS.items():
         if any(s in text for s in synonyms):
@@ -85,9 +74,29 @@ def expand_metric_terms(text: str) -> list[str]:
     return out
 
 
+def _covered_by_supported(candidate: str) -> bool:
+    return any(
+        candidate == supported or candidate in supported or supported in candidate
+        for supported in _SUPPORTED_TERMS
+    )
+
+
 def unsupported_terms_in(text: str) -> list[str]:
-    return [term for term in UNSUPPORTED_METRICS if term in text]
+    """问题里出现的“金融指标形态但不在白名单”的词（去重、长词优先）。"""
+    candidates = {
+        c for c in _METRIC_SHAPE.findall(text)
+        if len(c) >= 2 and not any(g in c for g in _GENERIC_WORDS)
+    }
+    out: list[str] = []
+    for candidate in sorted(candidates, key=len, reverse=True):
+        if _covered_by_supported(candidate):
+            continue
+        if any(candidate in existing for existing in out):
+            continue
+        out.append(candidate)
+    return out
 
 
 def is_future_question(text: str) -> bool:
-    return any(marker in text for marker in FUTURE_MARKERS)
+    """通用未来判据：出现未来时间/预测语气即视为未来问题。"""
+    return bool(_FUTURE_RE.search(text))

@@ -132,7 +132,7 @@ def test_引用错块时自动补正确引用():
     from app.rag.verify import repair_citations
 
     chunks = [
-        _chunk("c1", "| 乳制品 | 311.57亿元 | 36.41% |"),
+        _chunk("c1", "| 业务板块 | 2021年收入 | 占比 |\n| 乳制品 | 311.57亿元 | 36.41% |"),
         _chunk("c2", "2021年公司营业收入855.77亿元，同比增长21.92%。"),
     ]
     answer = "乳制品业务收入占营业收入的比重为36.41%。[c2]"
@@ -149,5 +149,19 @@ def test_修复不了时绝不改判据():
     answer = "公司毛利率为99.99%。[c1]"
     fixed = repair_citations(answer, chunks)
     assert fixed == answer
+    passed, _ratio, _verdicts = verify_answer(fixed, chunks)
+    assert not passed
+
+
+def test_数字相同但公司不同不得用于修复():
+    from app.rag.verify import repair_citations, verify_answer
+
+    chunks = [
+        {"citation_id": "c1", "source": "新能源-000-甲公司-2025", "text": "甲公司2025年经营正常。"},
+        {"citation_id": "c2", "source": "新能源-001-乙公司-2025", "text": "乙公司2025年营业收入100.00亿元。"},
+    ]
+    answer = "甲公司2025年营业收入100.00亿元。[c1]"
+    fixed = repair_citations(answer, chunks, entities={"甲公司"})
+    assert "[c2]" not in fixed
     passed, _ratio, _verdicts = verify_answer(fixed, chunks)
     assert not passed
