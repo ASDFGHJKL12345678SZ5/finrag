@@ -29,6 +29,7 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.winloop import ensure_selector_loop
 from app.eval.db import ensure_eval_database
+from app.eval.holdout import HOLDOUT_CORPUS_SEED, build_holdout
 from app.eval.schema import EVAL_SCHEMA_SQL
 from app.rag import store
 from app.rag.corpus import build_benchmark, build_corpus
@@ -200,16 +201,21 @@ async def run_eval(
     limit: int = 0,
     end2end_limit: int = 0,
     timeout_s: float = 120.0,
+    holdout: bool = False,
 ) -> dict:
     settings = get_settings()
     t_seed = time.perf_counter()
-    reports, eval_db = await seed_eval_corpus(n_companies, years, seed)
+    corpus_seed = HOLDOUT_CORPUS_SEED if holdout else seed
+    reports, eval_db = await seed_eval_corpus(n_companies, years, corpus_seed)
     seed_s = time.perf_counter() - t_seed
     n_chunks, _avg_len = await store.corpus_stats()
-    benchmark = build_benchmark(
-        reports, seed=seed,
-        n_exact=n_exact, n_abbr=n_abbr, n_calc=n_calc, n_refusal=n_refusal,
-    )
+    if holdout:
+        benchmark = build_holdout(reports)
+    else:
+        benchmark = build_benchmark(
+            reports, seed=seed,
+            n_exact=n_exact, n_abbr=n_abbr, n_calc=n_calc, n_refusal=n_refusal,
+        )
     if limit:
         benchmark = benchmark[:limit]
 
@@ -392,7 +398,8 @@ async def run_eval(
         "eval_database": eval_db,
         "mode": settings.embedding_mode,
         "llm_mode": settings.llm_mode,
-        "corpus_seed": seed,
+        "split": "holdout" if holdout else "train",
+        "corpus_seed": corpus_seed,
         "n_companies": n_companies,
         "years": list(years),
         "n_reports": len(reports),
@@ -497,6 +504,8 @@ def main() -> None:
     parser.add_argument("--end2end", type=int, default=0,
                         help="端到端最多跑多少道可答题（0=全跑）")
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--holdout", action="store_true",
+                        help="RW-2 留出集：换语料种子 20261026 + 新问句模板")
     args = parser.parse_args()
 
     years = tuple(int(y) for y in args.years.split(",") if y.strip())
@@ -509,7 +518,8 @@ def main() -> None:
     defaults = {"n_companies": args.companies, "years": years, "strategies": strategies,
                 "n_exact": args.exact, "n_abbr": args.abbr, "n_calc": args.calc,
                 "n_refusal": args.refusal, "limit": args.limit,
-                "end2end_limit": args.end2end, "timeout_s": args.timeout}
+                "end2end_limit": args.end2end, "timeout_s": args.timeout,
+                "holdout": args.holdout}
 
     runs: list[dict] = []
     for seed in seeds:
