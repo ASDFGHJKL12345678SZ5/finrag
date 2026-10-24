@@ -24,7 +24,9 @@ pg_trgm 的 GIN 索引对 2 字符中文模式基本无效（trigram 需要 3 �
   + 单行 `rag.corpus_stats(n_chunks, avg_len)`。
 - 重灌同一篇时先按旧 posting 扣减 df，再插新 posting（否则 df 只增不减）。
 - 查询改成一条 SQL：12 个词 `= ANY($1)` 查倒排，SQL 内用 BM25
-  （k1=1.2, b=0.75）打分，N/平均块长读单行统计表——**查询期零 count(*)、零全表扫描**。
+  （k1=1.2, b=0.75）打分，N/平均块长读单行统计表——**查询期零 count(*)、
+  不再做 12 路全表 ILIKE**；仍需把命中的 chunk_id join 回 chunks（8k 行约
+  1ms），但扫描的是 posting 而不是逐行 ILIKE。
 - 索引未建立时（旧库未重灌）自动退化到旧 ILIKE 实现，升级期不静默零召回。
 - `keyword_weights` 不再算 IDF（交给 BM25），只保留指标词 ×2 的领域加权。
 - 新增 `reset_lexical_index()`：评测/测试 TRUNCATE 文档后必须调用，否则 df 是脏的。
@@ -43,6 +45,19 @@ pg_trgm 的 GIN 索引对 2 字符中文模式基本无效（trigram 需要 3 �
 SQL 聚合仍是主要成本；**df 预计算才是大头（2.4× 合计加速）**。块数越大
 （FR-1 的 1000 篇 / ~1 万块）全表项越吃亏，倒排随 posting 线性增长，
 优势会扩大。recall 不下降这一条在 FR-1 大语料上按档位复测（本报告只测延迟）。
+
+## EXPLAIN 对照（8,000 块，`reports/fr4_explain.txt`）
+
+- **旧**：`Seq Scan on chunks` 8000 行 + 12 路 `ILIKE` Filter → Sort →
+  Limit；Execution **89.1ms**。
+- **新**：`Index Scan using chunk_terms_term_idx`（7 次，平均 6569 行/次）
+  → Hash Join `chunks`（8000 行，1.2ms）→ HashAggregate → Sort；
+  Execution **102ms**（这一次单跑；20 次查询中位数 111.5ms vs 旧 133.7ms）。
+
+新计划把"逐行 12 路 ILIKE"换成了"倒排 posting 扫描 + 一次 hash join"。
+注意：chunks 表仍被顺序扫描用于 join（8k 行成本 ~1ms），**这不是"完全无
+全表扫描"**；真正的收益来自 df 预计算（136–164ms → 1.8–4ms）与避免 12 路
+字符串匹配，而不是把 chunks 也变成索引-only。
 
 ## 正确性不变量（tests/test_lexical_index.py，6 条）
 

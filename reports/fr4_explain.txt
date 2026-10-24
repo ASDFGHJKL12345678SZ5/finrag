@@ -1,0 +1,57 @@
+=== 旧 ILIKE 全表（12 路 OR + 表达式排序）===
+Limit  (cost=1741.70..1741.71 rows=5 width=40) (actual time=89.035..89.038 rows=5 loops=1)
+  Buffers: shared hit=338
+  ->  Sort  (cost=1741.70..1761.61 rows=7965 width=40) (actual time=89.033..89.035 rows=5 loops=1)
+        Sort Key: ((((((((((((((((text ~~* '%营业收入%'::text))::integer * 4) + (((text ~~* '%同比%'::text))::integer * 2)) + (((text ~~* '%增长%'::text))::integer * 2)) + (((text ~~* '%宁德%'::text))::integer * 2)) + (((text ~~* '%润能%'::text))::integer * 2)) + (((text ~~* '%2025%'::text))::integer * 4)) + (((text ~~* '%年的%'::text))::integer * 2)) + (((text ~~* '%是多%'::text))::integer * 2)) + (((text ~~* '%少%'::text))::integer * 1)) + (((text ~~* '%亿元%'::text))::integer * 2)) + (((text ~~* '%公司%'::text))::integer * 2)) + (((text ~~* '%净利%'::text))::integer * 2)))::double precision) DESC
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=338
+        ->  Seq Scan on chunks  (cost=0.00..1609.40 rows=7965 width=40) (actual time=0.024..88.396 rows=8000 loops=1)
+              Filter: ((text ~~* '%营业收入%'::text) OR (text ~~* '%同比%'::text) OR (text ~~* '%增长%'::text) OR (text ~~* '%宁德%'::text) OR (text ~~* '%润能%'::text) OR (text ~~* '%2025%'::text) OR (text ~~* '%年的%'::text) OR (text ~~* '%是多%'::text) OR (text ~~* '%少%'::text) OR (text ~~* '%亿元%'::text) OR (text ~~* '%公司%'::text) OR (text ~~* '%净利%'::text))
+              Buffers: shared hit=335
+Planning:
+  Buffers: shared hit=140
+Planning Time: 1.815 ms
+Execution Time: 89.066 ms
+
+=== 新倒排 BM25（chunk_terms/term_df/corpus_stats）===
+Limit  (cost=1532.84..1532.85 rows=5 width=64) (actual time=102.004..102.009 rows=5 loops=1)
+  Buffers: shared hit=15063
+  ->  Sort  (cost=1532.84..1548.43 rows=6235 width=64) (actual time=102.003..102.007 rows=5 loops=1)
+        Sort Key: (sum((((t.weight * (ln(('1'::numeric + ((((corpus_stats.n_chunks - td.df))::numeric + 0.5) / ((td.df)::numeric + 0.5)))))::double precision) * (((ct.tf)::numeric * 2.2))::double precision) / ((ct.tf)::double precision + ('1.2'::double precision * ('0.25'::double precision + (((0.75 * (c.char_len)::numeric))::double precision / NULLIF(corpus_stats.avg_len, '0'::double precision)))))))) DESC
+        Sort Method: top-N heapsort  Memory: 26kB
+        Buffers: shared hit=15063
+        ->  HashAggregate  (cost=1366.93..1429.28 rows=6235 width=64) (actual time=100.458..101.403 rows=8000 loops=1)
+              Group Key: c.id, corpus_stats.n_chunks, corpus_stats.avg_len
+              Batches: 1  Memory Usage: 1681kB
+              Buffers: shared hit=15063
+              ->  Hash Join  (cost=516.04..930.48 rows=6235 width=76) (actual time=2.039..32.032 rows=45984 loops=1)
+                    Hash Cond: (ct.chunk_id = c.id)
+                    Buffers: shared hit=15063
+                    ->  Nested Loop  (cost=1.83..399.89 rows=6235 width=40) (actual time=0.048..23.001 rows=45984 loops=1)
+                          Buffers: shared hit=14728
+                          ->  Hash Join  (cost=1.41..17.71 rows=12 width=64) (actual time=0.033..0.163 rows=7 loops=1)
+                                Hash Cond: (td.term = t.term)
+                                Buffers: shared hit=8
+                                ->  Seq Scan on term_df td  (cost=0.00..13.68 rows=668 width=8) (actual time=0.005..0.061 rows=668 loops=1)
+                                      Buffers: shared hit=7
+                                ->  Hash  (cost=1.26..1.26 rows=12 width=56) (actual time=0.018..0.020 rows=12 loops=1)
+                                      Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                      Buffers: shared hit=1
+                                      ->  Nested Loop  (cost=0.01..1.26 rows=12 width=56) (actual time=0.014..0.017 rows=12 loops=1)
+                                            Buffers: shared hit=1
+                                            ->  Seq Scan on corpus_stats  (cost=0.00..1.01 rows=1 width=16) (actual time=0.008..0.008 rows=1 loops=1)
+                                                  Filter: (id = 1)
+                                                  Buffers: shared hit=1
+                                            ->  Function Scan on t  (cost=0.01..0.12 rows=12 width=40) (actual time=0.006..0.007 rows=12 loops=1)
+                          ->  Index Scan using chunk_terms_term_idx on chunk_terms ct  (cost=0.42..25.99 rows=586 width=19) (actual time=0.015..2.768 rows=6569 loops=7)
+                                Index Cond: (term = td.term)
+                                Buffers: shared hit=14720
+                    ->  Hash  (cost=414.65..414.65 rows=7965 width=44) (actual time=1.986..1.986 rows=8000 loops=1)
+                          Buckets: 8192  Batches: 1  Memory Usage: 689kB
+                          Buffers: shared hit=335
+                          ->  Seq Scan on chunks c  (cost=0.00..414.65 rows=7965 width=44) (actual time=0.002..1.164 rows=8000 loops=1)
+                                Buffers: shared hit=335
+Planning:
+  Buffers: shared hit=168
+Planning Time: 1.067 ms
+Execution Time: 102.280 ms
