@@ -1,10 +1,18 @@
 """FinRAG 问答状态机（LangGraph）。
 
 流程：
-    understand(查询理解) -> retrieve(混合检索) -> generate(带引用生成)
-        -> verify(引用校验) --不过且可重试--> retrieve(改写查询后重检索)
+    understand(查询理解) -> retrieve(混合检索) -> check_sufficiency(充分性守卫)
+        -> check_sufficiency --证据不足--> insufficient(拒答，不生成)
+        -> check_sufficiency --充分--> generate(带引用生成)
+        -> verify(引用校验) --不过且可重试--> rewrite_query(改写查询) -> retrieve
         -> verify --不过且重试耗尽--> insufficient(拒答)
         -> verify --通过--> done
+
+    check_sufficiency 是 D13 修复后**移到生成之前**的节点（回归测试
+    test_sufficiency_refusal_skips_generate 守死这一位置）：它命中拒答时
+    generate 一次都不执行——确定性判据、零 LLM 成本。早期版把它放在 verify
+    节点入口，而 generate 在 verify 之前，所以"拒答"实际发生在生成之后，
+    错年份问题仍会烧掉 3 次生成（初次 + 2 次重试）。
 
 设计决策：
 - 为什么用 LangGraph 而不是顺序函数：verify 不过要带着改写后的查询回到
@@ -29,6 +37,7 @@ from typing_extensions import TypedDict
 from app.core.logging import get_logger
 from app.rag.llm import get_llm
 from app.rag.retrieve import hybrid_search
+from app.rag.sufficiency import check_sufficiency
 from app.rag.verify import verify_answer
 
 log = get_logger("graph")
@@ -88,6 +97,53 @@ async def retrieve(state: RAGState) -> dict:
     }
 
 
+async def check_sufficiency_node(state: RAGState) -> dict:
+    """证据充分性守卫（D13）：问题问到的年份/指标在证据里不存在 -> 拒绝生成。
+
+    为什么独立成节点、且放在 generate **之前**：真实模式实测，问"预测未来三年营收"
+    这类问题时模型嘴上说"无法预测"但 status=done，拒答率掉到 0.1（1/10）——
+    **有据可依的胡说，引用校验拦不住**（它引用的是真 chunk、数字也是真的，
+    只是做了语料里没有的推断）。守卫补上这一层。
+
+    位置的价值（早期版放在 verify 入口的代价）：那时 generate 在 verify 之前，
+    "拒答"发生在生成之后，错年份问题仍会烧 3 次生成（初次 + 2 次重试）。
+    挪到检索之后，命中即拒**零 LLM 调用**——
+    tests/test_graph_integration.py::test_sufficiency_refusal_skips_generate 守死这一点。
+    """
+    started = time.perf_counter()
+    chunks = state.get("retrieved") or []
+    # 空检索守卫：一条证据都没有时直接判 insufficient。此前这段逻辑在 verify 里，
+    # 会导致 generate 拿空上下文、LLM 输出空答案——现在不生成。verify 侧保留
+    # 同样的判断作为单节点调用的兜底（两处判据一致，都由测试覆盖）。
+    if not chunks:
+        return {
+            "verdicts": [],
+            "status": "insufficient",
+            "refusal_reason": "retrieval_empty",
+            "trace": [_step("check_sufficiency", started, reason="retrieval_empty")],
+        }
+    reason = check_sufficiency(state.get("question", ""), chunks)
+    if reason:
+        log.info(
+            "graph.sufficiency_refusal",
+            extra={"context": {"reason": reason, "question": state.get("question", "")[:50]}},
+        )
+        return {
+            "verdicts": [],
+            "status": "insufficient",
+            "refusal_reason": reason,
+            "trace": [_step("check_sufficiency", started, passed=False, reason=reason)],
+        }
+    return {
+        "trace": [_step("check_sufficiency", started, passed=True, n=len(chunks))],
+    }
+
+
+def route_after_sufficiency(state: RAGState) -> Literal["generate", "__end__"]:
+    """证据不足 -> 直接结束（拒答是终态，不生成、不重试）。"""
+    return END if state.get("status") == "insufficient" else "generate"
+
+
 async def generate(state: RAGState) -> dict:
     """带引用生成：证据全部进 prompt，要求答案带 [cN] 引用编号。"""
     started = time.perf_counter()
@@ -106,7 +162,8 @@ async def verify(state: RAGState) -> dict:
     """引用校验：数字论断必须能在被引 chunk 里找到依据。"""
     started = time.perf_counter()
     chunks = state.get("retrieved") or []
-    # 空检索守卫：一条证据都没有时直接判 insufficient（断言的拒答边界）。
+    # 空检索守卫（幂等，与 check_sufficiency 节点同判据）：本节点被单独调用
+    # （单测/外部复用）时也要能给出正确结果，不能依赖调用方先跑守卫节点。
     # 之前 verify_answer 对"检索结果中没有相关资料，无法回答。"这种纯定性
     # 兜底文案会放行（无数字论断 -> passed），空库部署下全部问答 status=done，
     # "拒答"只剩话术没有终态。注意：qualitative hallucination（有检索证据但
@@ -118,27 +175,9 @@ async def verify(state: RAGState) -> dict:
             "refusal_reason": "retrieval_empty",
             "trace": [_step("verify", started, passed=False, reason="retrieval_empty")],
         }
-    # 证据充分性守卫（D13）：问题问到的年份/指标证据里不存在 -> 不生成直接拒。
-    # 真实模式下"预测类"问题模型嘴上拒答但 status=done（拒答率 0.1 的根因）——
-    # 这一层在生成前把"语料没有答案"的问题挡掉，确定性判据、零 LLM 成本。
-    from app.rag.sufficiency import check_sufficiency
-
-    refusal_reason = check_sufficiency(state.get("question", ""), chunks)
-    if refusal_reason:
-        log.info(
-            "graph.sufficiency_refusal",
-            extra={"context": {
-                "reason": refusal_reason,
-                "question": state.get("question", "")[:50],
-            }},
-        )
-        return {
-            "verdicts": [],
-            "status": "insufficient",
-            "refusal_reason": refusal_reason,
-            "trace": [_step("verify", started, passed=False, reason=refusal_reason)],
-        }
-    chunks = state.get("retrieved") or []
+    # 证据充分性守卫（D13）已上移到 check_sufficiency 节点（生成之前）——
+    # 见 graph 模块 docstring 与 test_sufficiency_refusal_skips_generate。
+    # 本节点只负责"答案里的数字有没有编造"。
     passed, ratio, verdicts = verify_answer(state.get("answer", ""), chunks)
     verdict_dicts = [
         {"claim": v.claim, "citation_id": v.citation_id,
@@ -163,8 +202,14 @@ async def verify(state: RAGState) -> dict:
 
 
 def route_after_verify(state: RAGState) -> Literal["rewrite_query", "__end__"]:
-    """校验不过且还有重试额度 -> 改写查询重检索；否则结束（含拒答）。"""
+    """校验不过且还有重试额度 -> 改写查询重检索；否则结束（含拒答）。
+
+    拒答原因存在时**不重试**：这类拒答（年份/指标不在证据中）改写查询也救不回来，
+    重试只会白烧 2 轮生成——实测 early 版对错年份问题烧了 3 次 generate。
+    """
     if state.get("status") == "done":
+        return END
+    if state.get("refusal_reason"):
         return END
     if state.get("retry_count", 0) < MAX_RETRIES:
         return "rewrite_query"
@@ -215,13 +260,17 @@ def build_rag_graph():
     builder = StateGraph(RAGState)
     builder.add_node("understand_query", understand_query)
     builder.add_node("retrieve", retrieve)
+    builder.add_node("check_sufficiency", check_sufficiency_node)
     builder.add_node("generate", generate)
     builder.add_node("verify", verify)
     builder.add_node("rewrite_query", rewrite_query)
 
     builder.add_edge(START, "understand_query")
     builder.add_edge("understand_query", "retrieve")
-    builder.add_edge("retrieve", "generate")
+    builder.add_edge("retrieve", "check_sufficiency")
+    builder.add_conditional_edges(
+        "check_sufficiency", route_after_sufficiency, ["generate", END]
+    )
     builder.add_edge("generate", "verify")
     builder.add_conditional_edges("verify", route_after_verify, ["rewrite_query", END])
     builder.add_edge("rewrite_query", "retrieve")

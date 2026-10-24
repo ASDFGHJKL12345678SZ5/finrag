@@ -8,8 +8,14 @@ done 而不是 insufficient，拒答率掉到 0.1（1/10）。**有据可依的�
 引用校验拦不住。**
 
 本模块补上确定性的一层：问题里的关键实体（年份 / 指标）在全部证据
-中不存在时，直接判 insufficient——不生成、不校验、不烧 LLM。
+中不存在时，直接判 insufficient——**不生成、不校验、零 LLM 调用**。
 判据全部可回溯（年份与指标名都是字面存在性），零模型依赖、可单测。
+
+**位置很重要（D13 后续修正）**：本模块由 graph.py 的 `check_sufficiency`
+节点在**检索之后、生成之前**调用。早期版把它放在 verify 节点入口，而
+generate 在 verify 之前——"拒答"实际发生在生成之后，错年份问题仍会
+烧 3 次生成（初次 + 2 次重试），"不生成"并不成立。守卫位置由
+`tests/test_graph_integration.py::test_sufficiency_refusal_skips_generate` 守死。
 
 与 verify.py 的分工：verify 管"答案里的数字有没有编造"（生成后校验），
 sufficiency 管"这个问题该不该答"（生成前门禁）。前者拦编造，后者拦

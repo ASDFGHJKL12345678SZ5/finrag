@@ -22,6 +22,7 @@ from app.core.winloop import ensure_selector_loop
 from app.rag import store
 from app.rag.corpus import build_corpus
 from app.rag.graph import ask
+from app.rag.graph import route_after_verify as g_route
 from app.rag.ingest import ingest_report
 
 ensure_selector_loop()
@@ -133,9 +134,76 @@ def test_拒答时检索链路仍然完整():
     _run(body)
 
 
+def test_sufficiency_refusal_skips_generate():
+    """充分性守卫必须在**生成之前**——命中拒答时 generate 一次都不许跑。
+
+    事故记录（D13 后续修正）：守卫原来挂在 verify 节点入口，而 generate 在
+    verify 之前，所以"生成前拒答"只是文档里的说法：实测错年份问题会
+    `retrieve -> generate -> verify 拒答 -> rewrite -> retrieve -> generate ...`
+    烧掉 **3 次生成**（初次 + 2 次重试），"零 LLM 成本"并不成立。
+    修正：守卫独立成 check_sufficiency 节点，插在 retrieve 与 generate 之间，
+    命中即条件边直达 END；route_after_verify 同时不再对"有拒答原因"的题重试。
+
+    本测试沿用 test_sse_single_run 的阵法：把 LLM 生成换成"一被调用就炸"的
+    探针——守卫位置回退，这里立刻红。
+
+    注意探针**必须挂在 LLM 客户端上**，不能挂在 graph.generate 这个模块属性上：
+    ask() 内部缓存的是 build_rag_graph() 编译好的图，节点函数在 compile 时
+    就已绑定，事后替换模块属性拦不住图里的节点（只会得到一个永远通过的假测试）。
+    """
+    async def body():
+        await _reset_and_seed(10, 42)
+
+        from app.rag import llm as llm_mod
+
+        def _tripwire(prompt):  # LLM 真被调用即失败
+            raise AssertionError("充分性守卫跑在 generate 之后了——零生成拒答已回退！")
+
+        client = llm_mod.get_llm()
+        original = client.generate
+        client.generate = _tripwire
+        try:
+            # 守卫在位 -> 不生成 -> 探针不该被触发 -> ask() 正常返回拒答终态。
+            # 守卫一旦被挪回"生成之后"，generate 会真的调 LLM，
+            # 探针抛的 AssertionError 从这里冒出去，测试以明确信息失败（fail-loud）。
+            final = await ask("宁德润能2024年的营业收入是多少？")  # 语料只有 2025
+        finally:
+            client.generate = original
+
+        assert final["status"] == "insufficient"
+        assert final["refusal_reason"] == "year_not_in_evidence"
+        nodes = [t["node"] for t in final.get("trace") or []]
+        assert "check_sufficiency" in nodes, nodes
+        assert "generate" not in nodes, f"生成被跳过了，但 trace 里出现了 generate: {nodes}"
+        assert final.get("retry_count", 0) == 0, "拒答不该重试（改写查询救不回来）"
+        assert not final.get("answer"), "拒答不该产出答案文本"
+
+    _run(body)
+
+
+def test_拒答路由不重试():
+    """route_after_verify 对"有拒答原因"的题必须直接结束，不许回到 rewrite_query。
+
+    纯函数级测试：不依赖数据库，锁死"拒答 = 终态"这条语义。
+    早期版只看 status == done，所以年份不存在的题也会被重试 2 轮（白烧生成）。
+    """
+    from langgraph.graph import END
+
+    assert g_route({"status": "done"}) == END
+    assert g_route({"status": "insufficient", "refusal_reason": "year_not_in_evidence"}) == END
+    assert g_route({"status": "insufficient", "refusal_reason": "retrieval_empty"}) == END
+    # 没有拒答原因的真·校验失败才允许重试（还有额度时）
+    assert g_route({"status": "insufficient", "retry_count": 0}) == "rewrite_query"
+    assert g_route({"status": "insufficient", "retry_count": 2}) == END
+
+
 def test_错年份问题被充分性守卫拒答():
     """D13 R7：问 2024 年（语料只有 2025）——不带任何 mock 触发词，
-    旧实现会拿 2025 的数据硬答；守卫必须在生成前拒答。"""
+    旧实现会拿 2025 的数据硬答；守卫必须拒答。
+
+    "在生成前"这一条由 test_sufficiency_refusal_skips_generate 单独守死，
+    本测试只看行为结果（status + 归因码）。
+    """
     async def body():
         reports = await _reset_and_seed(10, 42)
         company = reports[0].title.split("2025")[0]
