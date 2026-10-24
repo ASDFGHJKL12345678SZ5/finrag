@@ -1,0 +1,136 @@
+{
+  "mode": "local",
+  "split": "holdout",
+  "years": [
+    2021,
+    2022,
+    2023,
+    2024,
+    2025
+  ],
+  "llm_mode": "real",
+  "n_chunks": 8000,
+  "n_reports": 1000,
+  "retrieval": {
+    "hybrid": {
+      "abbr": {
+        "n": 60,
+        "mrr": 0.7806,
+        "recall@5": 0.9833,
+        "evidence_hit": 0.9833
+      },
+      "exact": {
+        "n": 80,
+        "mrr": 0.9604,
+        "recall@5": 1.0,
+        "evidence_hit": 0.9875
+      },
+      "refusal": {
+        "n": 0,
+        "mrr": 0.0,
+        "recall@5": 0.0,
+        "evidence_hit": 0.0
+      },
+      "calculation": {
+        "n": 20,
+        "mrr": 0.675,
+        "recall@5": 0.7,
+        "evidence_hit": 0.4
+      }
+    }
+  },
+  "latency_ms": {
+    "p50": 683.0,
+    "p95": 1281.5
+  },
+  "corpus_seed": 20261026,
+  "n_companies": 200,
+  "n_questions": 200,
+  "seed_time_s": 126.0,
+  "evaluated_at": "2026-10-24T20:00:34.115949+00:00",
+  "eval_database": "finrag_eval",
+  "end2end_sample": 160,
+  "answer_accuracy": {
+    "abbr": 0.9833,
+    "exact": 1.0,
+    "calculation": 0.4
+  },
+  "overall_accuracy": 0.84,
+  "refusal_accuracy": {
+    "wrong_year": 1.0,
+    "extra_future": 0.6,
+    "extra_metric": 0.25
+  },
+  "refusal_miss_rate": 0.475,
+  "guard_false_reject": {
+    "abbr": 0.0,
+    "exact": 0.0,
+    "calculation": 0.0
+  },
+  "retrieval_by_subtype": {
+    "hybrid": {
+      "yoy": {
+        "n": 8,
+        "mrr": 1.0,
+        "recall@5": 1.0,
+        "evidence_hit": 1.0
+      },
+      "abbr": {
+        "n": 60,
+        "mrr": 0.7806,
+        "recall@5": 0.9833,
+        "evidence_hit": 0.9833
+      },
+      "毛利率": {
+        "n": 15,
+        "mrr": 1.0,
+        "recall@5": 1.0,
+        "evidence_hit": 1.0
+      },
+      "industry_max": {
+        "n": 6,
+        "mrr": 0.0,
+        "recall@5": 0.0,
+        "evidence_hit": 0.0
+      },
+      "同比增长": {
+        "n": 11,
+        "mrr": 1.0,
+        "recall@5": 1.0,
+        "evidence_hit": 1.0
+      },
+      "营业收入": {
+        "n": 20,
+        "mrr": 0.8667,
+        "recall@5": 1.0,
+        "evidence_hit": 0.95
+      },
+      "segment_share": {
+        "n": 6,
+        "mrr": 0.9167,
+        "recall@5": 1.0,
+        "evidence_hit": 0.0
+      },
+      "归母净利润": {
+        "n": 11,
+        "mrr": 1.0,
+        "recall@5": 1.0,
+        "evidence_hit": 1.0
+      },
+      "研发费用率": {
+        "n": 13,
+        "mrr": 0.9615,
+        "recall@5": 1.0,
+        "evidence_hit": 1.0
+      },
+      "经营性现金流": {
+        "n": 10,
+        "mrr": 1.0,
+        "recall@5": 1.0,
+        "evidence_hit": 1.0
+      }
+    }
+  },
+  "citation_faithfulness": 0.9181,
+  "answer_accuracy_overall": 0.9187
+}
