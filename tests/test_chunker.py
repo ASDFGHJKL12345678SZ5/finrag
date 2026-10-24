@@ -72,3 +72,69 @@ def test_每个块都带source元数据():
 
 def test_空文档返回空列表():
     assert chunk_document("", source="empty") == []
+
+
+# ---- FR-3：表格感知分块（超长切分/表头重复/表格后接标题/文末表格）----
+
+def _table_doc(n_rows: int) -> str:
+    header = "| 指标 | 金额 | 增速 |" + chr(10) + "|---|---|---|"
+    rows = chr(10).join(
+        f"| 指标{i:02d} | {i * 1.1:.1f}亿元 | {i * 2.2:.1f}% |" for i in range(n_rows)
+    )
+    return "## 财务分析" + chr(10) + chr(10) + header + chr(10) + rows + chr(10)
+
+
+def test_超长表格按行组切分且每块重复表头():
+    n = 40
+    chunks = chunk_document(_table_doc(n), source="t1", max_chars=220, overlap=0)
+    tables = [c for c in chunks if c.kind == "table"]
+
+    assert len(tables) > 1, "超长表格必须切，且切出来的每块都是 table"
+    for c in tables:
+        lines = c.text.splitlines()
+        assert lines[0] == "| 指标 | 金额 | 增速 |", "每块必须以表头开头"
+        assert lines[1].startswith("|---"), "表头分隔行必须跟着重复"
+        assert len(c.text) <= 220, f"切分后仍超长：{len(c.text)}"
+        assert all(line.startswith("|") for line in lines), "表格块不能被句子滑窗污染"
+
+    # 数据行不丢、不重、顺序不变（跳过每块的两行表头）
+    data_rows = [line for c in tables for line in c.text.splitlines()[2:]]
+    assert len(data_rows) == n
+    assert data_rows[0].startswith("| 指标00 |")
+    assert data_rows[-1].startswith(f"| 指标{n - 1:02d} |")
+
+
+def test_文末表格的_kind_必须是_table():
+    doc = "## 附注" + chr(10) * 2 + "| a | b |" + chr(10) + "|---|---|" + chr(10) + "| 1 | 2 |"
+    chunks = chunk_document(doc, source="t2")
+    assert chunks, "不能因为文末没有正文就把表格丢掉"
+    assert chunks[-1].kind == "table", "旧实现 flush 默认 text，文末表格 kind 会错"
+    assert chunks[-1].section_path == "附注"
+    assert "1" in chunks[-1].text and "2" in chunks[-1].text
+
+
+def test_表格后接标题时_kind_与章节路径都正确():
+    doc = (
+        "## 一、财务" + chr(10) * 2
+        + "| 指标 | 2025年 |" + chr(10) + "|---|---|" + chr(10) + "| 营收 | 12.3亿元 |"
+        + chr(10) * 2
+        + "## 二、风险" + chr(10) * 2 + "行业竞争加剧。"
+    )
+    chunks = chunk_document(doc, source="t3")
+    table = next(c for c in chunks if c.kind == "table")
+    assert "营收" in table.text
+    assert table.section_path == "一、财务"
+
+    risk = next(c for c in chunks if "行业竞争" in c.text)
+    assert risk.kind == "text"
+    assert risk.section_path == "二、风险"
+    # 表格块必须在风险段之前（顺序不丢）
+    assert chunks.index(table) < chunks.index(risk)
+
+
+def test_无分隔行的表格也能整块保留():
+    doc = "## 简表" + chr(10) * 2 + "| 项目 | 数值 |" + chr(10) + "| 收入 | 1.0亿元 |"
+    chunks = chunk_document(doc, source="t4")
+    assert chunks[-1].kind == "table"
+    assert "1.0亿元" in chunks[-1].text
+
