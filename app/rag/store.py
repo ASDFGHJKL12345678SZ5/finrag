@@ -51,8 +51,9 @@ CREATE TABLE IF NOT EXISTS rag.chunks (
     UNIQUE (source, chunk_index)
 );
 
--- 结构化事实表（FR-10 跨文档聚合）：入库时把 Report.facts 的数值落成行，
+-- 结构化事实表（FR-10 跨文档聚合）：入库时从正文/表格抽取数值落成行，
 -- "行业营收最高的公司"这类 argmax 查询不再靠检索撞运气，直接 SQL 聚合。
+-- RW-1：数据来自 fact_extract 的文本解析，不读语料生成的 ground truth。
 CREATE TABLE IF NOT EXISTS rag.facts (
     fact_id TEXT PRIMARY KEY,
     source  TEXT NOT NULL REFERENCES rag.documents(source) ON DELETE CASCADE,
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS rag.facts (
     value   DOUBLE PRECISION NOT NULL,
     unit    TEXT NOT NULL DEFAULT '',
     answer  TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS facts_metric_year_idx ON rag.facts(metric, year);
@@ -150,6 +152,11 @@ async def init_store(dsn: str | None = None) -> asyncpg.Pool:
         # 用字面替换而不是 .format()：SQL 里有 JSONB 默认值的花括号，
         # format 会把它们当占位符直接炸（IndexError）
         await conn.execute(SCHEMA_SQL.replace("{dim}", str(settings.embedding_dim)))
+        # 旧库升级：RW-1 给 rag.facts 增加 chunk_index（CREATE IF NOT EXISTS 不改旧表）
+        await conn.execute(
+            "ALTER TABLE rag.facts ADD COLUMN IF NOT EXISTS"
+            " chunk_index INTEGER NOT NULL DEFAULT 0"
+        )
         # HNSW 索引条件建/纠（在连接内：需要 conn；逻辑见 _ensure_hnsw_opclass）
         await _ensure_hnsw_opclass(conn)
         # 列宽自检（最终审查修复）：CREATE TABLE IF NOT EXISTS 不会给旧库改列宽，
@@ -222,7 +229,7 @@ async def upsert_document(
 async def upsert_facts(source: str, facts: list[dict]) -> None:
     """重建一篇文档的结构化事实（FR-10）。
 
-    facts 元素：{fact_id, year, metric, segment, value, unit, answer}。
+    facts 元素：{fact_id, year, metric, segment, value, unit, answer, chunk_index}。
     先删后插：文档重灌时旧事实不能残留，否则聚合会拿到过期数字。
     """
     pool = get_pool()
@@ -232,13 +239,15 @@ async def upsert_facts(source: str, facts: list[dict]) -> None:
             await conn.executemany(
                 """
                 INSERT INTO rag.facts
-                    (fact_id, source, year, metric, segment, value, unit, answer)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    (fact_id, source, year, metric, segment, value, unit, answer,
+                     chunk_index)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 """,
                 [
                     (
                         f["fact_id"], source, f["year"], f["metric"],
-                        f.get("segment"), f["value"], f.get("unit", ""), f["answer"],
+                        f.get("segment"), f["value"], f.get("unit", ""),
+                        f["answer"], int(f.get("chunk_index", 0)),
                     )
                     for f in facts
                 ],

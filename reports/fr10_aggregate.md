@@ -46,3 +46,31 @@ FR-9 真实 800 题里 calculation 的 `industry_max` 只有 **3/20**：问"食�
 - 只支持整公司口径；分业务口径的 argmax 不在本轮（segment 事实已入库，
   后续可扩展"某品类收入最高的公司"）。
 - 历史库需重灌才会补 `rag.facts`；新库 `init_store` 自动建表。
+
+## RW-1 返工：事实改为从正文/表格抽取（2026-10-25）
+
+**原问题**：旧 `ingest.py` 直接把语料生成器的 `Report.facts`（ground truth）
+写进 `rag.facts`，聚合节点查表等于抄答案——industry_max 20/20 不能证明系统
+能从文本取数，属于**评测污染**。
+
+**改法**：
+- 新增 `app/rag/fact_extract.py`：`IngestDoc`（source/title/industry/report_date/
+  text/year/company 元信息，**无 facts**）+ 正文六类指标正则 + Markdown
+  分业务表格解析；抽不出就不入表。
+- `ingest.py` 拆出 `ingest_doc(IngestDoc)`；`ingest_report` 仅做 DTO 转换；
+  `rag.facts` 增加 `chunk_index`（事实来自哪一块）。
+- AST 不变量测试（`tests/test_fact_extract.py`）扫描 `ingest.py` /
+  `fact_extract.py` / `aggregate.py` / `store.py`：出现 `.facts` 属性或
+  `all_facts` 引用即失败。
+- 改坏表格单元格测试：把赢家营收改成 9999.99 亿元后重灌，聚合结果跟着变，
+  证明数据来自文本而非旧答案表。
+
+**抽取准确率（对 FactRegistry 对账，仅评测代码读 ground truth）**：
+
+| 语料 | 事实数 | Precision | Recall | 耗时 |
+|---|---|---|---|---|
+| 1000 篇 / 5 年 | 9000 | **1.000** | **1.000** | 0.1s |
+
+**真实模式复跑（calculation 100 题，¥2）**：**100/100**——industry_max 20/20、
+share 20/20、yoy/diff 60/60。最终 800 题总分 **799/800 = 99.9%**，
+见 `real_eval_800_rw1.md`（文本抽取版本，未掉分）。

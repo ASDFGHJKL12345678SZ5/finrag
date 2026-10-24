@@ -12,67 +12,37 @@ import numpy as np
 from app.core.logging import get_logger
 from app.rag import store
 from app.rag.chunker import chunk_document
-from app.rag.corpus import Report, all_facts, build_corpus
+from app.rag.corpus import Report, build_corpus
 from app.rag.embeddings import get_embedder
+from app.rag.fact_extract import doc_from_report, extract_facts
 
 log = get_logger("ingest")
 
 
-async def ingest_report(report: Report) -> int:
-    """单篇入库：分块 -> 向量化 -> 写库。返回块数。"""
-    chunks = chunk_document(report.text, source=report.source)
+async def ingest_doc(doc) -> int:
+    """单篇入库核心：只接收不含 facts 的 IngestDoc。"""
+    chunks = chunk_document(doc.text, source=doc.source)
     if not chunks:
-        log.warning("ingest.empty", extra={"context": {"source": report.source}})
+        log.warning("ingest.empty", extra={"context": {"source": doc.source}})
         return 0
     vectors = get_embedder().embed([c.text for c in chunks])
-    company = report.company
-    meta = (
-        {"abbr": company.abbr, "short": company.short, "code": company.code}
-        if company is not None
-        else {}
-    )
+    meta = {}
+    if doc.company_short:
+        meta = {"abbr": doc.abbr, "short": doc.company_short, "code": doc.code}
     await store.upsert_document(
-        source=report.source,
-        title=report.title,
-        industry=report.industry,
-        report_date=report.report_date,
+        source=doc.source,
+        title=doc.title,
+        industry=doc.industry,
+        report_date=doc.report_date,
         meta=meta,
     )
-    await store.upsert_facts(report.source, _fact_rows(report))
+    await store.upsert_facts(doc.source, extract_facts(doc, chunks))
     return await store.upsert_chunks(chunks, vectors)
 
 
-def _parse_fact_value(answer: str) -> tuple[float, str] | None:
-    """从 Fact.answer 抽数值与单位（"-13.1%" / "518.75亿元" / "1,234.5亿元"）。"""
-    import re
-
-    text = answer.replace(",", "").strip()
-    match = re.search(r"-?\d+(?:\.\d+)?", text)
-    if not match:
-        return None
-    unit = "%" if "%" in text else ("亿元" if "亿元" in text else "")
-    return float(match.group()), unit
-
-
-def _fact_rows(report) -> list[dict]:
-    """Report.facts -> rag.facts 行（FR-10 跨文档聚合的数据源）。"""
-    rows: list[dict] = []
-    year = report.year or 0
-    for fact in report.facts:
-        parsed = _parse_fact_value(fact.answer)
-        if parsed is None:
-            continue
-        value, unit = parsed
-        rows.append({
-            "fact_id": fact.fact_id,
-            "year": year,
-            "metric": "分业务收入" if fact.segment else fact.metric,
-            "segment": fact.segment or None,
-            "value": value,
-            "unit": unit,
-            "answer": fact.answer,
-        })
-    return rows
+async def ingest_report(report: Report) -> int:
+    """兼容入口：Report -> IngestDoc（只读文本/元信息），再走 ingest_doc。"""
+    return await ingest_doc(doc_from_report(report))
 
 
 async def ingest_corpus(
@@ -83,12 +53,15 @@ async def ingest_corpus(
     """整库入库（默认 200 公司 × 5 年 = 1000 篇）。返回统计。"""
     reports = build_corpus(n_companies=n_companies, years=years, seed=seed)
     total_chunks = 0
+    total_facts = 0
     for report in reports:
-        total_chunks += await ingest_report(report)
+        doc = doc_from_report(report)
+        total_chunks += await ingest_doc(doc)
+        total_facts += len(extract_facts(doc, chunk_document(doc.text, source=doc.source)))
     stats = {
         "reports": len(reports),
         "chunks": total_chunks,
-        "facts": len(all_facts(reports)),
+        "facts": total_facts,
     }
     log.info("ingest.done", extra={"context": stats})
     return stats
