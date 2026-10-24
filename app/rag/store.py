@@ -63,6 +63,28 @@ CREATE TABLE IF NOT EXISTS rag.chunks (
 -- trigram 索引：关键词召回走 ILIKE 路径（中文内置分词不可用，见 keyword_search）
 CREATE INDEX IF NOT EXISTS chunks_text_trgm
     ON rag.chunks USING gin (text gin_trgm_ops);
+
+-- FR-4 词法倒排索引：入库时维护 term -> (chunk, tf)，查询时不再全表 ILIKE、
+-- 不再 count(*) 算 df。2 字中文二元组直接做词条（pg 内置中文分词不可用）。
+CREATE TABLE IF NOT EXISTS rag.chunk_terms (
+    chunk_id BIGINT NOT NULL REFERENCES rag.chunks(id) ON DELETE CASCADE,
+    term     TEXT NOT NULL,
+    tf       INT NOT NULL,
+    PRIMARY KEY (chunk_id, term)
+);
+CREATE INDEX IF NOT EXISTS chunk_terms_term_idx ON rag.chunk_terms(term);
+
+CREATE TABLE IF NOT EXISTS rag.term_df (
+    term TEXT PRIMARY KEY,
+    df   INT NOT NULL
+);
+
+-- 单行统计（N / 平均块长）：BM25 需要，入库时刷新；查询时零 count(*)
+CREATE TABLE IF NOT EXISTS rag.corpus_stats (
+    id       INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    n_chunks BIGINT NOT NULL DEFAULT 0,
+    avg_len  DOUBLE PRECISION NOT NULL DEFAULT 0
+);
 """
 
 _pool: asyncpg.Pool | None = None
@@ -182,30 +204,127 @@ async def upsert_document(
 
 
 async def upsert_chunks(chunks: list[Chunk], vectors: np.ndarray) -> int:
-    """批量写入块。先删旧块再插（文档重建时不留孤儿）。"""
+    """批量写入块。先删旧块再插（文档重建时不留孤儿），同步维护词法索引。
+
+    FR-4：写块同时更新 `chunk_terms`（chunk→term tf）与 `term_df`（全局 df），
+    查询时只查倒排索引，不再对 chunks 全表 ILIKE。删除旧块前先扣减旧词频，
+    否则重灌同一篇会让 df 越来越大（IDF 失真、热门词被过度惩罚）。
+    """
     if len(chunks) != len(vectors):
         raise ValueError("chunks 与 vectors 数量不一致")
     if not chunks:
         return 0
     pool = get_pool()
     async with pool.acquire() as conn, conn.transaction():
+        old_ids = [
+            r["id"] for r in await conn.fetch(
+                "SELECT id FROM rag.chunks WHERE source = $1", chunks[0].source
+            )
+        ]
+        if old_ids:
+            await _decay_term_df(conn, old_ids)
         await conn.execute("DELETE FROM rag.chunks WHERE source = $1", chunks[0].source)
-        await conn.executemany(
-            """
+
+        new_ids: list[int] = []
+        for i, c in enumerate(chunks):
+            cid = await conn.fetchval(
+                """
                 INSERT INTO rag.chunks
                     (source, section_path, chunk_index, kind, text, embedding, char_len)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id
                 """,
-            [
-                (
-                    c.source, c.section_path, c.chunk_index, c.kind, c.text,
-                    _vec_literal(vectors[i]), len(c.text),
-                )
-                for i, c in enumerate(chunks)
-            ],
-        )
+                c.source, c.section_path, c.chunk_index, c.kind, c.text,
+                _vec_literal(vectors[i]), len(c.text),
+            )
+            new_ids.append(cid)
+        await _index_chunk_terms(conn, new_ids, chunks)
+        await _refresh_corpus_stats(conn)
+        await conn.execute("DELETE FROM rag.term_df WHERE df <= 0")
     log.info("chunks.upserted", extra={"context": {"source": chunks[0].source, "n": len(chunks)}})
     return len(chunks)
+
+
+async def _decay_term_df(conn, chunk_ids: list[int]) -> None:
+    """旧块删除前扣减 df（与 _index_chunk_terms 的增量对称）。"""
+    await conn.execute(
+        """
+        UPDATE rag.term_df td
+           SET df = td.df - sub.c
+          FROM (
+                SELECT term, count(*) AS c
+                  FROM rag.chunk_terms
+                 WHERE chunk_id = ANY($1::bigint[])
+                 GROUP BY term
+               ) sub
+         WHERE td.term = sub.term
+        """,
+        chunk_ids,
+    )
+
+
+async def _index_chunk_terms(conn, chunk_ids: list[int], chunks: list[Chunk]) -> None:
+    """把每块的词条（正文 + source 元数据）写入倒排索引并累加 df。"""
+    from collections import Counter
+
+    rows: list[tuple[int, str, int]] = []
+    for cid, chunk in zip(chunk_ids, chunks, strict=True):
+        # source 也进索引：财务块的正文只有指标、公司名只在 source 里
+        # （旧 ILIKE 路同时查 text/source，这一条是它的等价物）
+        terms = _extract_terms(chunk.text, limit=64) + _extract_terms(
+            chunk.source, limit=16
+        )
+        for term, tf in Counter(terms).items():
+            rows.append((cid, term, tf))
+    if not rows:
+        return
+    await conn.executemany(
+        "INSERT INTO rag.chunk_terms (chunk_id, term, tf) VALUES ($1, $2, $3)"
+        " ON CONFLICT (chunk_id, term) DO UPDATE SET tf = rag.chunk_terms.tf + EXCLUDED.tf",
+        rows,
+    )
+    await conn.execute(
+        """
+        INSERT INTO rag.term_df (term, df)
+        SELECT term, count(*) FROM rag.chunk_terms
+         WHERE chunk_id = ANY($1::bigint[])
+         GROUP BY term
+        ON CONFLICT (term) DO UPDATE SET df = rag.term_df.df + EXCLUDED.df
+        """,
+        chunk_ids,
+    )
+
+
+async def _refresh_corpus_stats(conn) -> None:
+    await conn.execute(
+        """
+        INSERT INTO rag.corpus_stats (id, n_chunks, avg_len)
+        SELECT 1, count(*), coalesce(avg(char_len), 0) FROM rag.chunks
+        ON CONFLICT (id) DO UPDATE
+           SET n_chunks = EXCLUDED.n_chunks, avg_len = EXCLUDED.avg_len
+        """
+    )
+
+
+async def reset_lexical_index() -> None:
+    """清空词法索引（评测/测试 TRUNCATE 文档后必须调用，否则 df 是脏的）。"""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE rag.chunk_terms")
+        await conn.execute("TRUNCATE rag.term_df")
+        await conn.execute("TRUNCATE rag.corpus_stats")
+        await conn.execute(
+            "INSERT INTO rag.corpus_stats (id, n_chunks, avg_len) VALUES (1, 0, 0)"
+        )
+    invalidate_company_cache()
+
+
+def invalidate_company_cache() -> None:
+    """文档集合变化后清公司名缓存（评测重灌/测试隔离）。"""
+    global _company_cache, _company_cache_at
+    _company_cache = None
+    _company_cache_at = 0.0
+
 
 
 async def vector_search(
@@ -233,22 +352,68 @@ async def keyword_search(
     industry: str | None = None,
     weights: dict[str, float] | None = None,
 ) -> list[dict]:
-    """关键词召回：查询里的实义片段做 trigram 模糊匹配，命中越多分越高。
+    """关键词召回：BM25（倒排索引）+ 预计算 df（FR-4）。
 
-    为什么不用内置中文分词：pg 内置 simple 配置对中文按整句切，recall 差。
-    trigram 对连续子串匹配有效，代价是索引体积，万级块可接受。
+    旧实现每次查询对 chunks 全表 ILIKE 匹配 12 个二元组、再全表 count(*) 算
+    df——O(N) 扫描 × 12，万级块下 P95 秒级，且 pg_trgm 索引对 2 字符模式
+    基本无效。现在：
+    - 入库时维护 `chunk_terms`（chunk→term tf）与 `term_df`（term→df）
+    - 查询把 12 个词当参数查倒排索引，SQL 内用 BM25(k1=1.2, b=0.75) 打分
+    - N / 平均块长取自 `corpus_stats` 单行表，查询期零 count(*)
+    - weights 只保留领域加权（指标词 ×2），IDF 由 BM25 的 df 直接算
     """
     terms = _extract_terms(query)[:12]
     if not terms:
         return []
-    n = len(terms)
-    # 词权重：调用方传 IDF（稀有词权重高）；不传则等权（兼容旧行为）
     weights = weights or {}
-    # 按词长加权：命中"宁德润能"（4 字）比命中"年的"（2 字）更能说明
-    # 文档相关——不用真 IDF（要全表统计），词长是零成本的近似
-    # 得分 = 命中数 * 词长 * IDF。公司名在每个块都出现（df 高），指标词
-    # 只出现在财务块（df 低）——没有 IDF 时公司名霸榜，问归母净利润捞回来
-    # 的是只写营业收入的概况块（评测 answer_accuracy 63% 的根因）
+    term_list = list(dict.fromkeys(terms))
+    term_weights = [float(weights.get(t, 1.0)) for t in term_list]
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        stats = await conn.fetchrow(
+            "SELECT n_chunks, avg_len FROM rag.corpus_stats WHERE id = 1"
+        )
+        if not stats or not stats["n_chunks"]:
+            # 索引未建立（旧库/未重灌）：退回旧 ILIKE 实现，避免静默零召回
+            return await _keyword_search_legacy(conn, term_list, top_k, industry, weights)
+        rows = await conn.fetch(
+            """
+            WITH q AS (
+                SELECT * FROM unnest($1::text[], $2::float8[]) AS t(term, weight)
+            ), st AS (
+                SELECT n_chunks, avg_len FROM rag.corpus_stats WHERE id = 1
+            )
+            SELECT c.source, c.section_path, c.chunk_index, c.kind, c.text,
+                   SUM(
+                       q.weight
+                       * ln(1 + (st.n_chunks - td.df + 0.5) / (td.df + 0.5))
+                       * (ct.tf * 2.2)
+                       / (ct.tf + 1.2 * (0.25 + 0.75 * c.char_len
+                                          / NULLIF(st.avg_len, 0)))
+                   ) AS score
+              FROM q
+              JOIN rag.term_df td   ON td.term = q.term
+              JOIN rag.chunk_terms ct ON ct.term = q.term
+              JOIN rag.chunks c      ON c.id = ct.chunk_id
+              CROSS JOIN st
+             WHERE ($3::text IS NULL OR c.source IN (
+                    SELECT source FROM rag.documents WHERE industry = $3))
+             GROUP BY c.id, c.source, c.section_path, c.chunk_index,
+                      c.kind, c.text, st.n_chunks, st.avg_len
+             ORDER BY score DESC
+             LIMIT $4
+            """,
+            term_list, term_weights, industry, top_k,
+        )
+    return [dict(r) for r in rows]
+
+
+async def _keyword_search_legacy(
+    conn, terms: list[str], top_k: int, industry: str | None, weights: dict[str, float]
+) -> list[dict]:
+    """旧 ILIKE 实现（仅索引未建立时兜底，保证升级期不静默零召回）。"""
+    n = len(terms)
+
     def _w(i: int) -> str:
         return str(round(weights.get(terms[i], 1.0), 6))
 
@@ -258,10 +423,6 @@ async def keyword_search(
         " * 0.5) * " + _w(i)
         for i in range(n)
     )
-    # WHERE 同时看正文和 source 元数据：财务块的正文只有指标没有公司名，
-    # 公司名在 source 里——不匹配元数据的话，各公司的财务块同分相持，
-    # 问 A 公司的净利润会返回 B 公司的财务块（实测 answer_accuracy 的
-    # 最后 20% 差距就是这个）
     where_clause = " OR ".join(
         "text ILIKE '%'||$" + str(i + 2) + "||'%'"
         " OR source ILIKE '%'||$" + str(i + 2) + "||'%'"
@@ -277,20 +438,17 @@ async def keyword_search(
         + " SELECT source FROM rag.documents WHERE industry = $" + str(industry_param)
         + ")) ORDER BY score DESC LIMIT $1"
     )
-    params = [top_k, *terms, industry]
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, *params)
+    rows = await conn.fetch(sql, top_k, *terms, industry)
     return [dict(r) for r in rows]
 
 
 async def company_names() -> list[str]:
-    """全部已知公司名（从 documents.source 解析：{industry}-{idx:03d}-{company}）。
+    """全部已知公司名（source 形如 `{industry}-{idx:03d}-{company}-{year}`）。
 
-    实体锚定（D13）的输入：问题里出现哪个公司名，就把该公司文档的块
-    加分——易混公司对（共享前缀）下，完整实体名是唯一可靠的判别依据。
-    带 60s TTL 缓存：一次评测上千次检索，公司集合在评测周期内不变，
-    不该每次都查库（缓存是优化不是依赖，TTL 过期自然刷新）。
+    返回公司简称与 3 字缩写（FR-1：问题会用简称/缩写而非全名）。实体锚定
+    （D13）靠"问题里出现哪个名字"给对应文档加权——易混公司共享前缀时，
+    完整简称是最长匹配依据；缩写在简称里是前缀，最长匹配会优先选简称。
+    60s TTL：一次评测上千次检索，公司集合在评测周期内不变。
     """
     global _company_cache, _company_cache_at
     import time as _time
@@ -300,21 +458,65 @@ async def company_names() -> list[str]:
         return list(_company_cache)
     pool = get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT source FROM rag.documents")
-    names = [r["source"].split("-", 2)[2] for r in rows if r["source"].count("-") >= 2]
-    _company_cache, _company_cache_at = names, now
-    return list(names)
+        rows = await conn.fetch("SELECT source, meta FROM rag.documents")
+    names: list[str] = []
+    for row in rows:
+        parts = row["source"].split("-")
+        if len(parts) >= 3 and parts[2]:
+            names.append(parts[2])
+        meta = row["meta"] or {}
+        # asyncpg 默认把 jsonb 返回成 str（未注册 codec），这里显式解析
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except json.JSONDecodeError:
+                meta = {}
+        abbr = meta.get("abbr") if isinstance(meta, dict) else None
+        if abbr:
+            names.append(str(abbr))
+    _company_cache, _company_cache_at = list(dict.fromkeys(names)), now
+    return list(_company_cache)
+
+
+async def corpus_stats() -> tuple[int, float]:
+    """(N, 平均块长) —— 入库时维护在 corpus_stats 单行表，查询期零 count(*)。"""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT n_chunks, avg_len FROM rag.corpus_stats WHERE id = 1"
+        )
+    if not row:
+        return 0, 0.0
+    return int(row["n_chunks"]), float(row["avg_len"] or 0.0)
 
 
 async def term_df(terms: list[str]) -> dict[str, int]:
-    """一批词各自的文档频率（df）——IDF 加权的输入。
+    """一批词各自的文档频率（df）——从入库时维护的 term_df 表查（FR-4）。
 
-    一次 SQL 用逐列聚合算完，不按词循环查（10 个词就是 10 次往返）。
+    旧实现在查询时对 chunks 全表做 12 路 ILIKE + 逐列聚合，是关键词路最贵的
+    一步；现在退化成一次主键/索引查询。索引未建立（旧库未重灌）时兜底到
+    旧算法，保证升级期数值不突变。
     """
     terms = list(dict.fromkeys(terms))
     if not terms:
         return {}
     pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT term, df FROM rag.term_df WHERE term = ANY($1::text[])", terms
+        )
+        counts = dict.fromkeys(terms, 0)
+        for row in rows:
+            counts[row["term"]] = int(row["df"])
+        if not any(counts.values()):
+            n_chunks = await conn.fetchval("SELECT count(*) FROM rag.chunks")
+            if n_chunks:
+                return await _term_df_legacy(conn, terms)
+    return counts
+
+
+async def _term_df_legacy(conn, terms: list[str]) -> dict[str, int]:
+    """旧的全表 df 计算（仅索引未建立时兜底）。"""
     clauses = " OR ".join(
         "text ILIKE '%'||$" + str(i + 1) + "||'%'"
         " OR source ILIKE '%'||$" + str(i + 1) + "||'%'"
@@ -325,9 +527,7 @@ async def term_df(terms: list[str]) -> dict[str, int]:
         " + (source ILIKE '%'||$" + str(i + 1) + "||'%')::int > 0)::int AS hit_" + str(i)
         for i in range(len(terms))
     )
-    sql = f"SELECT {selects} FROM rag.chunks WHERE {clauses}"
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, *terms)
+    rows = await conn.fetch(f"SELECT {selects} FROM rag.chunks WHERE {clauses}", *terms)
     counts = dict.fromkeys(terms, 0)
     for row in rows:
         for i, t in enumerate(terms):
@@ -387,7 +587,7 @@ def boost_metric_terms(question: str, weights: dict[str, float]) -> dict[str, fl
     return out
 
 
-def _extract_terms(query: str) -> list[str]:
+def _extract_terms(query: str, limit: int = 12) -> list[str]:
     """从查询里提取检索用词。
 
     中文没有空格，整句是一个连续串——直接拿去做 ILIKE 永远匹配不上。
@@ -412,4 +612,4 @@ def _extract_terms(query: str) -> list[str]:
     seen: dict[str, None] = {}
     for t in terms:
         seen.setdefault(t, None)
-    return list(seen)[:12]
+    return list(seen)[:limit]

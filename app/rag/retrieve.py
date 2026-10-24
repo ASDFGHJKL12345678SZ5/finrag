@@ -110,29 +110,16 @@ def fuse(
 
 
 async def keyword_weights(question: str) -> dict[str, float]:
-    """关键词路的 IDF + 指标词加权（hybrid_search 与评测共用同一份权重）。
+    """关键词路的领域权重（FR-4 起 IDF 由 SQL 里的 BM25 直接算）。
 
-    为什么要共享：评测的三策略对比要公平——keyword_only 与 hybrid 只应差
-    "检索策略"，不应差"打分函数"。早期版评测自己不带 weights 调关键词路，
-    before/after 表把关键词路加权的增益错算成了融合的功劳。
+    为什么不在这里算 IDF：df 已经入库预计算，BM25 在一条 SQL 里用 df 打分；
+    这里只保留"指标词加权"这一层领域先验（与检索策略无关）。早期版在这里
+    每次查询 `count(*)` + 全表 df，是关键词路最贵的两次 O(N) 扫描。
     """
-    from app.rag.store import (
-        _extract_terms,
-        boost_metric_terms,
-        idf_weights,
-        term_df,
-    )
+    from app.rag.store import _extract_terms, boost_metric_terms
 
     terms = _extract_terms(question)[:12]
-    pool = store.get_pool()
-    async with pool.acquire() as conn:
-        n_chunks = await conn.fetchval("SELECT count(*) FROM rag.chunks")
-    df = await term_df(terms)
-    # N 用块数而非文档数：IDF 的语义单元是"块被检索到"，与召回的粒度一致
-    weights = idf_weights(terms, df, n_chunks)
-    # 指标词加权：查询的意图核心是指标（归母净利润），不是公司名——
-    # 公司名只定位文档，指标才定位到真正回答问题的块
-    return boost_metric_terms(question, weights)
+    return boost_metric_terms(question, dict.fromkeys(terms, 1.0))
 
 
 async def hybrid_search(
