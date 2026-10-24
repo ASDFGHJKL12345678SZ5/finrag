@@ -58,11 +58,24 @@ def show(d: dict, trace: bool = False) -> None:
     print(f"重试轮次: {d.get('retry_count', 0)}")
 
 
+def ask_and_show(question: str, trace: bool = False) -> None:
+    """问一次并展示；把「连不上 API」收成一行提示，不向用户抛栈。
+
+    单问题模式与交互模式共用这一个入口：早期版只在交互循环里捕获
+    httpx.HTTPError，`ask.py "问题"` 这条最常用的路径反而裸奔——API 没起时
+    用户看到的是整屏堆栈（而且当时异常类还拼错成 HTError，连捕获都进不去）。
+    """
+    try:
+        show(ask(question), trace=trace)
+    except httpx.HTTPError as e:
+        print(f"连不上 API（{e}）——先另开窗口跑: .venv/Scripts/python.exe -m app.main")
+
+
 def main() -> None:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     trace = "--trace" in sys.argv
     if args:
-        show(ask(" ".join(args)), trace=trace)
+        ask_and_show(" ".join(args), trace=trace)
         return
     print("FinRAG 问答客户端（直接回车退出）")
     print("试试: 青蓝动力2025年的归母净利润是多少？")
@@ -76,10 +89,7 @@ def main() -> None:
             break
         if not q:
             break
-        try:
-            show(ask(q), trace=trace)
-        except httpx.HTError as e:
-            print(f"连不上 API（{e}）——先另开窗口跑: .venv/Scripts/python.exe -m app.main")
+        ask_and_show(q, trace=trace)
 
 
 if __name__ == "__main__":
