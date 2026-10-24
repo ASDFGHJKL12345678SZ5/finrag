@@ -38,7 +38,41 @@ async def ingest_report(report: Report) -> int:
         report_date=report.report_date,
         meta=meta,
     )
+    await store.upsert_facts(report.source, _fact_rows(report))
     return await store.upsert_chunks(chunks, vectors)
+
+
+def _parse_fact_value(answer: str) -> tuple[float, str] | None:
+    """从 Fact.answer 抽数值与单位（"-13.1%" / "518.75亿元" / "1,234.5亿元"）。"""
+    import re
+
+    text = answer.replace(",", "").strip()
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    unit = "%" if "%" in text else ("亿元" if "亿元" in text else "")
+    return float(match.group()), unit
+
+
+def _fact_rows(report) -> list[dict]:
+    """Report.facts -> rag.facts 行（FR-10 跨文档聚合的数据源）。"""
+    rows: list[dict] = []
+    year = report.year or 0
+    for fact in report.facts:
+        parsed = _parse_fact_value(fact.answer)
+        if parsed is None:
+            continue
+        value, unit = parsed
+        rows.append({
+            "fact_id": fact.fact_id,
+            "year": year,
+            "metric": "分业务收入" if fact.segment else fact.metric,
+            "segment": fact.segment or None,
+            "value": value,
+            "unit": unit,
+            "answer": fact.answer,
+        })
+    return rows
 
 
 async def ingest_corpus(

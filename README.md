@@ -1,5 +1,7 @@
 # FinRAG — 金融研报知识库问答系统
 
+[![CI](https://github.com/ASDFGHJKL12345678SZ5/finrag/actions/workflows/ci.yml/badge.svg)](https://github.com/ASDFGHJKL12345678SZ5/finrag/actions/workflows/ci.yml)
+
 > 项目二（与 DataCrew 电商智能问数**零代码共享、强差异化**）：
 > DataCrew 答"数据库里有什么"（结构化数据 / text-to-SQL / 安全闸），
 > FinRAG 答"研报里怎么说的"（非结构化文档 / 检索增强生成 / 引用校验）。
@@ -103,7 +105,7 @@ frontend/
   tests/              50 项 vitest 单测（断帧重组/CRLF/多帧粘包/事件机/快照语义/组件与外壳冒烟）
 scripts/load_test.py 压测（含 SOCKS 代理选项）
 deploy/postgres/init/ 实例级扩展（vector + pg_trgm）
-tests/                116 个测试：分块（含表格）/向量契约/语料合法性/检索（倒排/融合/重排）/校验器（边界+单位+多引用）/守卫（独立词典）/评测隔离/API 安全/SSE
+tests/                126 个测试：分块（含表格）/向量契约/语料合法性/检索（倒排/融合/重排）/校验器（边界+单位+多引用+引用修复）/聚合（facts/argmax）/守卫（独立词典）/评测隔离/API 安全/SSE
 ```
 
 ## 3. 设计决策日志（ADR）
@@ -153,7 +155,8 @@ tests/                116 个测试：分块（含表格）/向量契约/语料�
 | D13+ | 守卫位置修正：`check_sufficiency` 独立成节点（检索后、生成前）+ 拒答不重试（62 → **64** 测试：+1 守卫位置探针 +1 拒答路由） | ✅ |
 | FR-2/3/5/7/8 | 守卫独立词典 + 评测库隔离/逐题明细 + 表格感知分块 + 校验/改写收紧 + 并发/SSE 超时 + API Key/限流/CORS/Langfuse（**102** 测试） | ✅ |
 | FR-1/4/6 | 难基准 200×5=1000 篇/800 题 + 倒排 BM25（df 预计算）+ RRF/rerank 可选（116 测试；mock 总通过 96.6%） | ✅ |
-| D7 | 与 DataCrew 一起收尾（CI/架构图/简历数字核验） | 待办 |
+| FR-10/11 | 跨文档聚合（facts 表 + SQL argmax + 图节点）+ 引用自动修复（126 测试；真实 800 题 99.9%） | ✅ |
+| D7 | 与 DataCrew 一起收尾（CI/架构图/简历数字核验） | ✅ CI 双 job + Redis service；§1 架构图；简历数字逐项指向 reports/（见 §4.7/§4.8） |
 
 ## 4.5 评测结果（D13 分级，可复现）
 
@@ -375,32 +378,38 @@ cross-encoder 偏好连贯文本，表格行在它眼里不如现金流段落"�
 ——这也是 FR-1 保留它、不藏它的原因。详见
 [`reports/fr6_fusion.md`](reports/fr6_fusion.md)。
 
-### 真实模型 800 题（FR-9，local embedding + DeepSeek）
+### 真实模型 800 题（FR-9 + FR-10/11 后最终）
 
 一次跑完 800 题（700 可答 + 100 拒答），独立库 `finrag_eval`，seed=42：
 
-| 档 | mock | **真实 DeepSeek** | 说明 |
+| 档 | mock（FR-10/11 后） | **真实 DeepSeek（最终）** | 说明 |
 |---|---|---|---|
 | exact | 100% | **300/300 = 100%** | 简称 + canonical 指标 |
 | abbr | 98.0% | **300/300 = 100%** | 缩写/同义说法 |
-| calculation | 79.0% | **77/100 = 77.0%** | yoy 40/40、yoy_diff 20/20、share 14/20、industry_max 3/20 |
+| calculation | 99.0% | **99/100 = 99%** | yoy 40/40、yoy_diff 20/20、share 19/20、industry_max **20/20** |
 | refusal | 100% | **100/100 = 100%** | 三类各 100% |
-| **总** | 96.6% | **777/800 = 97.1%** | answer_accuracy（可答档）96.7% |
+| **总** | 99.1% | **799/800 = 99.9%** | answer_accuracy（可答档）99.86% |
 
 真实模式 retrieval（hybrid）：exact/abbr recall@5 100%、calculation 81%，
-全档 MRR 0.919；守卫误拒 0%；引用忠实度 97.2%（6 道 share 题答案算对但
-引用块里没有那个百分比，被校验判 insufficient——是校验的保守，不是答案错）；
-P50 640ms / P95 995ms。成本未单独计量（800 次 DeepSeek 调用）。
+全档 MRR 0.914；表格题 recall 100%；守卫误拒 0%；引用忠实度 **99.9%**；
+P50 613.5ms / P95 956ms。成本未单独计量（800 次 DeepSeek 调用）。
 
-**迭代期 200 题样本（分层打散，修正了第一次只抽到 yoy 的偏差）**：
-exact/abbr 100%、calculation 77.3%、refusal 100%；overall 95.0% 低于全量
-800 的 97.1%，原因是样本里 calculation 占 1/3（全量只占 14.3%），不是系统
-退化——分档与全量一致。详见 [`reports/real_eval_200.md`](reports/real_eval_200.md)。
+**修复轨迹（同一个 800 题基准）**：FR-9 时 97.1%（industry_max 3/20、
+share 14/20）→ FR-10 跨文档聚合 + FR-11 引用修复/指标词典补"收入"后
+**99.9%**（industry_max 20/20、share 19/20）。唯一失败是一道 share 题的
+"因此……"结论句被内容词门禁判无据（数字本身正确），属于校验过严的边界，
+已写进 [`reports/real_eval_800_after_fr10.md`](reports/real_eval_800_after_fr10.md)。
+FR-10/FR-11 的设计见 [`reports/fr10_aggregate.md`](reports/fr10_aggregate.md)、
+[`reports/fr11_citation_repair.md`](reports/fr11_citation_repair.md)。
 
-**真实 vs mock 的差异**：abbr 真实更高（100% vs 98%）——真实模型会做
-同义换算；calculation 真实 77% 略低于 mock 79%，但结构一致：yoy/两年差全对，
-分业务占比 14/20（6 题引用块错位），行业极值 3/20（唯一能靠"检索恰好捞到
-赢家"答对的情形）。这组数字比"小语料 100%"更能说明系统真实能力边界。
+**迭代期 200 题样本（分层打散，FR-10/11 之前跑的）**：
+exact/abbr 100%、calculation 77.3%、refusal 100%；overall 95.0%，原因是
+样本里 calculation 占 1/3（全量只占 14.3%），不是系统退化。该样本不包含
+聚合/引用修复，已被上面的最终 800 题取代，保留作过程证据。
+
+**真实 vs mock 的差异**：abbr 真实 100% vs mock 98%——真实模型会做同义换算；
+calculation 两边都是 99%，结构一致：yoy/两年差全对、分业务占比 19/20、
+行业极值 20/20。这组数字比"小语料 100%"更能说明系统真实能力边界。
 
 ## 5. 本地运行
 

@@ -35,10 +35,11 @@ from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from app.core.logging import get_logger
+from app.rag.aggregate import AggregateSpec, answer_aggregate, detect_aggregate
 from app.rag.llm import get_llm
 from app.rag.retrieve import hybrid_search
 from app.rag.sufficiency import check_sufficiency
-from app.rag.verify import verify_answer
+from app.rag.verify import repair_citations, verify_answer
 
 log = get_logger("graph")
 
@@ -53,6 +54,7 @@ class RAGState(TypedDict, total=False):
     session_id: str
     original_question: str  # 首轮原始问题：rewrite_query 改写时依托它重建，
     industry: str | None
+    aggregate: dict | None     # 行业极值查询的解析结果（FR-10）；None 走普通 RAG
     retrieved: list[dict]
     answer: str
     verdicts: list[dict]
@@ -75,15 +77,48 @@ def _step(node: str, started: float, **detail: Any) -> dict:
 
 
 async def understand_query(state: RAGState) -> dict:
-    """查询理解：识别行业过滤条件 + 抽取关键实体词。"""
+    """查询理解：识别行业过滤条件 + 抽取关键实体词 + 聚合意图。"""
     started = time.perf_counter()
     q = state["question"]
     industry = next((w for w in _INDUSTRY_WORDS if w in q), None)
     entities = [t for t in re.findall(r"[一-龥A-Za-z0-9]{2,}", q)][:6]
-    log.info("graph.understand", extra={"context": {"industry": industry}})
+    spec = detect_aggregate(q)
+    log.info(
+        "graph.understand",
+        extra={"context": {"industry": industry, "aggregate": bool(spec)}},
+    )
     return {
         "industry": industry,
-        "trace": [_step("understand_query", started, industry=industry, entities=entities)],
+        "aggregate": spec.__dict__ if spec else None,
+        "trace": [_step("understand_query", started, industry=industry,
+                        entities=entities, aggregate=bool(spec))],
+    }
+
+
+async def aggregate_node(state: RAGState) -> dict:
+    """行业极值：SQL 聚合取赢家，零 LLM 调用（FR-10）。
+
+    这类题问的是"40 家公司里哪家最高"，检索只能捞到个别文档，argmax
+    本来就该走结构化事实表。拿不到数据就拒答，不拿别家数字凑。
+    """
+    started = time.perf_counter()
+    raw = state.get("aggregate") or {}
+    spec = AggregateSpec(
+        industry=raw["industry"], year=raw["year"], metric=raw["metric"]
+    )
+    result = await answer_aggregate(spec)
+    if result is None:
+        return {
+            "verdicts": [],
+            "status": "insufficient",
+            "refusal_reason": "aggregate_empty",
+            "trace": [_step("aggregate", started, found=False)],
+        }
+    return {
+        "answer": result["answer"],
+        "retrieved": result["retrieved"],
+        "trace": [_step("aggregate", started, found=True,
+                        company=result["company"], value=result["value"])],
     }
 
 
@@ -144,6 +179,16 @@ def route_after_sufficiency(state: RAGState) -> Literal["generate", "__end__"]:
     return END if state.get("status") == "insufficient" else "generate"
 
 
+def route_after_understand(state: RAGState) -> Literal["aggregate", "retrieve"]:
+    """行业极值走聚合节点；其余走普通检索。"""
+    return "aggregate" if state.get("aggregate") else "retrieve"
+
+
+def route_after_aggregate(state: RAGState) -> Literal["verify", "__end__"]:
+    """聚合无数据 -> 直接拒答；有答案 -> 复用 verify 校验引用。"""
+    return END if state.get("status") == "insufficient" else "verify"
+
+
 async def generate(state: RAGState) -> dict:
     """带引用生成：证据全部进 prompt，要求答案带 [cN] 引用编号。"""
     started = time.perf_counter()
@@ -178,7 +223,10 @@ async def verify(state: RAGState) -> dict:
     # 证据充分性守卫（D13）已上移到 check_sufficiency 节点（生成之前）——
     # 见 graph 模块 docstring 与 test_sufficiency_refusal_skips_generate。
     # 本节点只负责"答案里的数字有没有编造"。
-    passed, ratio, verdicts = verify_answer(state.get("answer", ""), chunks)
+    # 引用自动修复（FR-10）：数字在别的 retrieved 块里有据、但模型引错块时，
+    # 给该句补上正确引用；只补引用不改数字，修不好仍按原判据拒答。
+    answer = repair_citations(state.get("answer", ""), chunks)
+    passed, ratio, verdicts = verify_answer(answer, chunks)
     verdict_dicts = [
         {"claim": v.claim, "citation_id": v.citation_id,
          "supported": v.supported, "missing": v.missing}
@@ -192,11 +240,13 @@ async def verify(state: RAGState) -> dict:
         }},
     )
     return {
+        "answer": answer,
         "verdicts": verdict_dicts,
         "status": status,
         "trace": [_step(
             "verify", started,
             passed=passed, ratio=round(ratio, 3), claims=len(verdict_dicts),
+            citation_repaired=answer != state.get("answer", ""),
         )],
     }
 
@@ -256,6 +306,7 @@ def build_rag_graph():
     """组装问答状态机。"""
     builder = StateGraph(RAGState)
     builder.add_node("understand_query", understand_query)
+    builder.add_node("aggregate", aggregate_node)
     builder.add_node("retrieve", retrieve)
     builder.add_node("check_sufficiency", check_sufficiency_node)
     builder.add_node("generate", generate)
@@ -263,7 +314,10 @@ def build_rag_graph():
     builder.add_node("rewrite_query", rewrite_query)
 
     builder.add_edge(START, "understand_query")
-    builder.add_edge("understand_query", "retrieve")
+    builder.add_conditional_edges(
+        "understand_query", route_after_understand, ["aggregate", "retrieve"]
+    )
+    builder.add_conditional_edges("aggregate", route_after_aggregate, ["verify", END])
     builder.add_edge("retrieve", "check_sufficiency")
     builder.add_conditional_edges(
         "check_sufficiency", route_after_sufficiency, ["generate", END]

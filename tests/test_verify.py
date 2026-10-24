@@ -125,3 +125,29 @@ def test_多引用句_两个chunk都参与核对():
     assert passed2 is False
     assert any("16.85" in m for m in verdicts2[0].missing)
 
+
+
+def test_引用错块时自动补正确引用():
+    """FR-10：答案算对但引错块（分业务表 c1 才是证据）。"""
+    from app.rag.verify import repair_citations
+
+    chunks = [
+        _chunk("c1", "| 乳制品 | 311.57亿元 | 36.41% |"),
+        _chunk("c2", "2021年公司营业收入855.77亿元，同比增长21.92%。"),
+    ]
+    answer = "乳制品业务收入占营业收入的比重为36.41%。[c2]"
+    fixed = repair_citations(answer, chunks)
+    assert "[c1]" in fixed
+    passed, _ratio, verdicts = verify_answer(fixed, chunks)
+    assert passed and all(v.supported for v in verdicts)
+
+
+def test_修复不了时绝不改判据():
+    from app.rag.verify import repair_citations
+
+    chunks = [_chunk("c1", "公司2025年实现营业收入378.43亿元。")]
+    answer = "公司毛利率为99.99%。[c1]"
+    fixed = repair_citations(answer, chunks)
+    assert fixed == answer
+    passed, _ratio, _verdicts = verify_answer(fixed, chunks)
+    assert not passed

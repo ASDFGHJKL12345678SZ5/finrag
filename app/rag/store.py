@@ -51,6 +51,22 @@ CREATE TABLE IF NOT EXISTS rag.chunks (
     UNIQUE (source, chunk_index)
 );
 
+-- 结构化事实表（FR-10 跨文档聚合）：入库时把 Report.facts 的数值落成行，
+-- "行业营收最高的公司"这类 argmax 查询不再靠检索撞运气，直接 SQL 聚合。
+CREATE TABLE IF NOT EXISTS rag.facts (
+    fact_id TEXT PRIMARY KEY,
+    source  TEXT NOT NULL REFERENCES rag.documents(source) ON DELETE CASCADE,
+    year    INTEGER NOT NULL,
+    metric  TEXT NOT NULL,
+    segment TEXT,
+    value   DOUBLE PRECISION NOT NULL,
+    unit    TEXT NOT NULL DEFAULT '',
+    answer  TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS facts_metric_year_idx ON rag.facts(metric, year);
+CREATE INDEX IF NOT EXISTS facts_source_idx ON rag.facts(source);
+
 -- HNSW 向量索引不在 SCHEMA_SQL 里建：算子类必须和查询运算符一致（查询用 <=>
 -- 余弦距离，索引就得是 vector_cosine_ops（ADR-08）。曾经用 vector_ip_ops，
 -- 计划器直接用不上索引，万行 chunks 全表扫描（EXPLAIN 可见 Seq Scan）。向量已
@@ -201,6 +217,73 @@ async def upsert_document(
             """,
             source, title, industry, parsed_date, meta_json,
         )
+
+
+async def upsert_facts(source: str, facts: list[dict]) -> None:
+    """重建一篇文档的结构化事实（FR-10）。
+
+    facts 元素：{fact_id, year, metric, segment, value, unit, answer}。
+    先删后插：文档重灌时旧事实不能残留，否则聚合会拿到过期数字。
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute("DELETE FROM rag.facts WHERE source = $1", source)
+        if facts:
+            await conn.executemany(
+                """
+                INSERT INTO rag.facts
+                    (fact_id, source, year, metric, segment, value, unit, answer)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                [
+                    (
+                        f["fact_id"], source, f["year"], f["metric"],
+                        f.get("segment"), f["value"], f.get("unit", ""), f["answer"],
+                    )
+                    for f in facts
+                ],
+            )
+
+
+async def aggregate_facts(
+    metric: str, year: int, industry: str | None = None, direction: str = "max"
+) -> dict | None:
+    """跨文档聚合：某指标/年份/行业下最大（或最小）值及其来源。
+
+    只查 segment IS NULL 的整公司口径事实；分业务事实是另一个维度，
+    混进来会把"某业务收入"当成公司营收。
+    """
+    order = "DESC" if direction == "max" else "ASC"
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            SELECT f.source, f.value, f.unit, f.answer, f.metric, f.year,
+                   d.title, d.industry
+              FROM rag.facts f
+              JOIN rag.documents d ON d.source = f.source
+             WHERE f.metric = $1 AND f.year = $2 AND f.segment IS NULL
+               AND ($3::text IS NULL OR d.industry = $3)
+             ORDER BY f.value {order}
+             LIMIT 1
+            """,
+            metric, year, industry,
+        )
+    return dict(row) if row else None
+
+
+async def chunks_for_source(source: str) -> list[dict]:
+    """一篇文档的全部块（聚合答案选证据块用）。"""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT source, section_path, chunk_index, kind, text
+              FROM rag.chunks WHERE source = $1 ORDER BY chunk_index
+            """,
+            source,
+        )
+    return [dict(r) for r in rows]
 
 
 async def upsert_chunks(chunks: list[Chunk], vectors: np.ndarray) -> int:

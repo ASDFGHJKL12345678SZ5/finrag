@@ -89,6 +89,47 @@ def split_claims(answer: str) -> list[tuple[str, str]]:
     return claims
 
 
+def repair_citations(answer: str, chunks: list[dict]) -> str:
+    """把"引用错块"的论断自动改引到真正含该数字的块（FR-10）。
+
+    真实模式实测：分业务占比题模型算对了 23.45%，却引用了多年营收表 c2
+    （只有总营收），而含"占比 23.45%"的分业务表 c1 就在 retrieved 里——
+    校验按"被引块"判，于是正确答案被拒。这里做确定性修复：
+    逐句检查，若论断在已引块里无据、但在**另一条 retrieved 块**里有据，
+    就给该句补上那块引用。只补引用、不改数字/文字；找不到就原样返回
+    （绝不为了过校验而放宽判据）。
+    """
+    if not answer or not chunks:
+        return answer
+    by_id = {c.get("citation_id"): c for c in chunks if c.get("citation_id")}
+    parts = re.split(r"(?<=[。；;\n])", answer)
+    repaired: list[str] = []
+    for segment in parts:
+        claims = split_claims(segment)
+        if len(claims) != 1:
+            repaired.append(segment)
+            continue
+        claim, citation_id = claims[0]
+        cited = set(citation_id.split("+")) if citation_id else set()
+        evidence = " ".join(by_id[c]["text"] for c in cited if c in by_id)
+        if evidence and not _missing_evidence(claim, evidence):
+            repaired.append(segment)
+            continue
+        candidate = next(
+            (
+                c for c in chunks
+                if c.get("citation_id") not in cited
+                and not _missing_evidence(claim, c["text"])
+            ),
+            None,
+        )
+        if candidate is None:
+            repaired.append(segment)
+            continue
+        repaired.append(f"[{candidate['citation_id']}]" + segment.lstrip())
+    return "".join(repaired)
+
+
 def verify_answer(
     answer: str, chunks: list[dict]
 ) -> tuple[bool, float, list[ClaimVerdict]]:

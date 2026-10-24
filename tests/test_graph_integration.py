@@ -139,7 +139,8 @@ def test_正常问答走通并带有效引用():
         # 引用可回溯：每个论断的引用编号都必须在 citations 里存在
         cids = {c["citation_id"] for c in final["retrieved"]}
         for v in final.get("verdicts") or []:
-            assert v["citation_id"] in cids, "引用编号必须可回溯到具体 chunk"
+            for cid in v["citation_id"].split("+"):
+                assert cid in cids, "引用编号必须可回溯到具体 chunk"
         # 答案忠实度：标准答案里的数字应出现在生成答案中
         import re
 
