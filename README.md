@@ -253,7 +253,7 @@ answer_accuracy 63.3% → 100% 的修复过程（评测驱动，每个数字可�
 | 并发（FR-5） | ONNX 推理阻塞事件循环；/ask 每请求 build 图 | `asyncio.to_thread` 查询向量；进程级图单例；SSE 整体超时 | `tests/test_embeddings.py` / `test_rag_graph_是进程级单例` / `test_sse_整体超时…` |
 | LLM 重试（FR-5） | 所有异常重试 3 次（含 401/400） | 只重试超时/连接/429/5xx；401/400 立即失败 | `tests/test_llm_retry.py` |
 | API 安全（FR-8） | 无鉴权、限流、CORS `*`、异常原文回传 | `X-API-Key` 鉴权 + Redis Lua 令牌桶（429/Retry-After）+ CORS 收紧 + 错误编号脱敏 | `tests/test_api_security.py` 10 条 |
-| 可观测（FR-8） | Langfuse 配置存在但代码零引用 | 每次问答一条 trace，检索/守卫/生成/校验为 span；未配 key/云端故障自动降级 | 同上 |
+| 可观测（FR-8） | Langfuse 配置存在但代码零引用 | 每次问答一条 trace，检索/守卫/生成/校验为 span；未配 key/云端故障自动降级；**已用真实 key 验证**：Langfuse v2 observations 能查到 `finrag.qa` 与 5 个 span（`scripts/verify_langfuse.py`） | 同上 |
 
 ### 压测（FR-5，mock 模式 1/10/50/100/200）
 
@@ -358,19 +358,21 @@ FR-9 单独跑、单独报（成本与延迟见下节）。
 
 ### 融合实验（FR-6，local embedding，只测检索）
 
-| 策略 | exact recall / MRR | abbr | calculation | 全档 MRR |
-|---|---|---|---|---|
-| vector_only | 90.0% / 0.800 | 87.7% / 0.779 | 74.0% / 0.694 | 0.776 |
-| hybrid（min-max） | **100% / 0.968** | **100% / 0.924** | 81% / 0.772 | 0.921 |
-| rrf（k=60） | 100% / 0.930 | 91.7% / 0.868 | **83% / 0.780** | 0.882 |
-| rrf_rerank（bge-reranker-base） | **100% / 0.986** | **100% / 0.975** | 82% / 0.748 | **0.947** |
+| 策略 | exact recall / MRR | abbr | calculation | 表格题（segment_share） | 全档 MRR |
+|---|---|---|---|---|---|
+| vector_only | 83.3% / 0.740 | 85.3% / 0.751 | 70.0% / 0.673 | 60.0% / 0.542 | 0.735 |
+| hybrid（min-max） | **100% / 0.956** | **100% / 0.914** | 81% / 0.779 | **100% / 0.942** | 0.913 |
+| rrf（k=60） | 100% / 0.931 | 90.0% / 0.851 | **82% / 0.783** | 100% / 0.942 | 0.875 |
+| rrf_rerank（bge-reranker-base） | **100% / 0.984** | **100% / 0.977** | 81% / 0.738 | 95% / 0.746 | **0.946** |
 
-**选型**：RRF 单独用会掉召回（abbr 100%→91.7%）——只看名次，关键词路在等价
-说法上的名次不稳时，向量路把正确块挤出去。重排把召回救回、MRR 最高
-（0.947），代价是每次 +~140ms 与 1.04GB 模型。默认仍用 **hybrid**（100/100/81、
-MRR 0.921，零额外模型与延迟）；`FUSION_STRATEGY=rrf_rerank` 供质量优先场景。
-四策略 calculation 都卡在 ~80%，根因是 20 道行业极值题需要跨 40 家公司 argmax，
-不是融合能补的——这也是 FR-1 保留它、不藏它的原因。详见
+**选型**：RRF 单独用会掉召回（abbr 100%→90%）——只看名次，关键词路在等价
+说法上的名次不稳时，向量路把正确块挤出去。重排把 abbr 召回救回、
+全档 MRR 最高（0.946），但**表格题 recall 100%→95%、MRR 0.942→0.746**：
+cross-encoder 偏好连贯文本，表格行在它眼里不如现金流段落"像答案"。
+默认仍用 **hybrid**（exact/abbr/表格 recall 全 100%，MRR 0.913，零额外模型
+与延迟）；`FUSION_STRATEGY=rrf_rerank` 供纯文本问答场景。四策略 calculation
+都卡在 ~80%，根因是 20 道行业极值题需要跨 40 家公司 argmax，不是融合能补的
+——这也是 FR-1 保留它、不藏它的原因。详见
 [`reports/fr6_fusion.md`](reports/fr6_fusion.md)。
 
 ### 真实模型 800 题（FR-9，local embedding + DeepSeek）
@@ -389,6 +391,11 @@ MRR 0.921，零额外模型与延迟）；`FUSION_STRATEGY=rrf_rerank` 供质量
 全档 MRR 0.919；守卫误拒 0%；引用忠实度 97.2%（6 道 share 题答案算对但
 引用块里没有那个百分比，被校验判 insufficient——是校验的保守，不是答案错）；
 P50 640ms / P95 995ms。成本未单独计量（800 次 DeepSeek 调用）。
+
+**迭代期 200 题样本（分层打散，修正了第一次只抽到 yoy 的偏差）**：
+exact/abbr 100%、calculation 77.3%、refusal 100%；overall 95.0% 低于全量
+800 的 97.1%，原因是样本里 calculation 占 1/3（全量只占 14.3%），不是系统
+退化——分档与全量一致。详见 [`reports/real_eval_200.md`](reports/real_eval_200.md)。
 
 **真实 vs mock 的差异**：abbr 真实更高（100% vs 98%）——真实模型会做
 同义换算；calculation 真实 77% 略低于 mock 79%，但结构一致：yoy/两年差全对，

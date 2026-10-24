@@ -237,6 +237,10 @@ async def run_eval(
         st: {cat: {"n": 0, "source": 0, "evidence": 0, "mrr": 0.0} for cat in ALL_CATEGORIES}
         for st in strategies
     }
+    retrieval_sub: dict[str, dict[str, dict[str, float]]] = {
+        st: defaultdict(lambda: {"n": 0, "source": 0, "evidence": 0, "mrr": 0.0})
+        for st in strategies
+    }
     answer: dict[str, dict[str, int]] = {
         cat: {"n": 0, "ok": 0} for cat in ANSWER_CATEGORIES
     }
@@ -273,6 +277,12 @@ async def run_eval(
                 cell["source"] += int(hit)
                 cell["evidence"] += int(ev)
                 cell["mrr"] += (1.0 / rank) if rank else 0.0
+                sub = q.subtype or q.category
+                sub_cell = retrieval_sub[st][sub]
+                sub_cell["n"] += 1
+                sub_cell["source"] += int(hit)
+                sub_cell["evidence"] += int(ev)
+                sub_cell["mrr"] += (1.0 / rank) if rank else 0.0
                 record["retrieval"][st] = {
                     "rank": rank, "source_hit": hit, "evidence_hit": ev,
                     "top_sources": [r["source"] for r in rows[:5]],
@@ -345,6 +355,20 @@ async def run_eval(
                 "mrr": round(cell["mrr"] / n, 4) if n else 0.0,
             }
 
+    # 按子类（表格题 segment_share / 行业极值等）单独报，FR-6 要求
+    # "精确/简称/计算/表格"分档看得见
+    retrieval_sub_metrics: dict[str, dict[str, dict[str, float]]] = {}
+    for st in strategies:
+        retrieval_sub_metrics[st] = {}
+        for sub, cell in sorted(retrieval_sub[st].items()):
+            n = int(cell["n"])
+            retrieval_sub_metrics[st][sub] = {
+                "n": n,
+                "recall@5": _rate(int(cell["source"]), n),
+                "evidence_hit": _rate(int(cell["evidence"]), n),
+                "mrr": round(cell["mrr"] / n, 4) if n else 0.0,
+            }
+
     answerable_n = sum(v["n"] for v in answer.values())
     answerable_ok = sum(v["ok"] for v in answer.values())
     refusal_n = sum(v["n"] for v in refusal.values())
@@ -377,6 +401,7 @@ async def run_eval(
         "end2end_sample": end2end_used,
         "seed_time_s": round(seed_s, 1),
         "retrieval": retrieval_metrics,
+        "retrieval_by_subtype": retrieval_sub_metrics,
         "answer_accuracy": {
             cat: (_rate(v["ok"], v["n"]) if v["n"] else None)
             for cat, v in answer.items()
@@ -507,6 +532,10 @@ def main() -> None:
                            _collect(runs, ("retrieval", st, cat, "recall@5")), seeds))
         print(_fmt_raw(f"mrr {st} (all answerable)",
                        [_mrr_all(r, st) for r in runs], seeds))
+        print(_fmt_row(f"表格题 recall {st} (segment_share)",
+                       _collect(runs, ("retrieval_by_subtype", st, "segment_share", "recall@5")), seeds))
+        print(_fmt_raw(f"表格题 MRR {st}",
+                       _collect(runs, ("retrieval_by_subtype", st, "segment_share", "mrr")), seeds))
     for cat in ANSWER_CATEGORIES:
         print(_fmt_row(f"answer_accuracy ({cat})",
                        _collect(runs, ("answer_accuracy", cat)), seeds))
