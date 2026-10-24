@@ -18,7 +18,7 @@ from typing import Any, Protocol
 
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -79,49 +79,80 @@ class MockLLM:
         return "根据检索到的研报内容。" + "".join(parts)
 
 
-# 真实模式 LLM 调用策略（最终审查修复）：
-# - timeout=60：OpenAI SDK 默认 600s——真实模式下一次挂起会把整个 uvicorn
-#   worker 冻结 10 分钟，并发 /ask 全部排队（mock 压测数字掩盖了这点）。
-# - SDK 层 max_retries=0 + tenacity 3 次指数退避：重试策略收敛到一处、
-#   可日志观测；两层都开会长成 3x3=9 次调用，成本失控。
-LLM_TIMEOUT_S = 60.0
-LLM_MAX_ATTEMPTS = 3
-
-
-class OpenAILLM:
-    """OpenAI 兼容客户端（DeepSeek）。仅在 real 模式使用。"""
-
-    name = "deepseek-chat"
-
-    def __init__(self) -> None:
-        from openai import OpenAI  # 延迟导入：mock 模式不装也能跑
-
-        settings = get_settings()
-        self._client = OpenAI(
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key or os.environ.get("LLM_API_KEY", ""),
-            timeout=LLM_TIMEOUT_S,
-            max_retries=0,
-        )
-        self._model = settings.llm_model
-        self.calls = 0
-
-    @retry(
-        retry=retry_if_exception_type(Exception),
-        stop=stop_after_attempt(LLM_MAX_ATTEMPTS),
-        wait=wait_exponential(multiplier=1, min=1, max=8),
-        reraise=True,
-    )
-    def generate(self, prompt: str, **kwargs: Any) -> str:
-        self.calls += 1
-        resp = self._client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=kwargs.get("temperature", 0.1),
-        )
-        return resp.choices[0].message.content or ""
-
-
+# 真实模式 LLM 调用策略（最终审查修复）：
+# - timeout=60：OpenAI SDK 默认 600s——真实模式下一次挂起会把整个 uvicorn
+#   worker 冻结 10 分钟，并发 /ask 全部排队（mock 压测数字掩盖了这点）。
+# - SDK 层 max_retries=0 + tenacity 3 次指数退避：重试策略收敛到一处、
+#   可日志观测；两层都开会长成 3x3=9 次调用，成本失控。
+LLM_TIMEOUT_S = 60.0
+LLM_MAX_ATTEMPTS = 3
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """只有"可恢复"错误才重试（FR-5）。
+
+    旧版 retry_if_exception_type(Exception) 把 401（key 错）、400（请求非法）
+    也重试 3 次——救不回来，还放大成本、拖慢失败反馈。可恢复 = 超时 / 连接
+    错误 / 429 限流 / 5xx 服务端错误；4xx 业务错误立即失败。
+    """
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    try:
+        from openai import (
+            APIConnectionError,
+            APITimeoutError,
+            InternalServerError,
+            RateLimitError,
+        )
+        if isinstance(
+            exc,
+            (APITimeoutError, APIConnectionError, RateLimitError, InternalServerError),
+        ):
+            return True
+    except ImportError:  # mock 模式没装 openai：类型判据退化为状态码/类名
+        pass
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and (status == 429 or status >= 500):
+        return True
+    return type(exc).__name__ in {
+        "APITimeoutError", "APIConnectionError", "RateLimitError", "InternalServerError",
+    }
+
+
+class OpenAILLM:
+    """OpenAI 兼容客户端（DeepSeek）。仅在 real 模式使用。"""
+
+    name = "deepseek-chat"
+
+    def __init__(self) -> None:
+        from openai import OpenAI  # 延迟导入：mock 模式不装也能跑
+
+        settings = get_settings()
+        self._client = OpenAI(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key or os.environ.get("LLM_API_KEY", ""),
+            timeout=LLM_TIMEOUT_S,
+            max_retries=0,
+        )
+        self._model = settings.llm_model
+        self.calls = 0
+
+    @retry(
+        retry=retry_if_exception(_is_retryable),
+        stop=stop_after_attempt(LLM_MAX_ATTEMPTS),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        reraise=True,
+    )
+    def generate(self, prompt: str, **kwargs: Any) -> str:
+        self.calls += 1
+        resp = self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=kwargs.get("temperature", 0.1),
+        )
+        return resp.choices[0].message.content or ""
+
+
 def _extract_field(prompt: str, field: str) -> str:
     """从 prompt 里取 'field：xxx' 行的值。"""
     for line in prompt.splitlines():
@@ -172,15 +203,15 @@ def _extract_evidence(prompt: str) -> list[tuple[str, str]]:
         i += 1
     return evidence
 
-def get_llm() -> LLM:
-    """按配置返回 LLM。单件缓存：真实模式下每个节点都新建 client/连接池
-    纯属浪费，MockLLM 的 calls 计数也才能被读到（测试可断言）。"""
-    return _llm_singleton()
-
-
-@lru_cache(maxsize=1)
-def _llm_singleton() -> LLM:
-    settings = get_settings()
-    if settings.llm_mode == "mock":
-        return MockLLM()
+def get_llm() -> LLM:
+    """按配置返回 LLM。单件缓存：真实模式下每个节点都新建 client/连接池
+    纯属浪费，MockLLM 的 calls 计数也才能被读到（测试可断言）。"""
+    return _llm_singleton()
+
+
+@lru_cache(maxsize=1)
+def _llm_singleton() -> LLM:
+    settings = get_settings()
+    if settings.llm_mode == "mock":
+        return MockLLM()
     return OpenAILLM()

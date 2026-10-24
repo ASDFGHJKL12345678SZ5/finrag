@@ -277,12 +277,22 @@ def build_rag_graph():
 _graph = None
 
 
-async def ask(question: str, session_id: str = "default") -> dict:
-    """问一次：驱动状态机跑到底，返回最终状态（含拒答）。"""
+def get_rag_graph():
+    """进程级单例图（FR-5）：/ask 每个请求 build 一次是纯浪费——
+    构图（add_node/add_edge/compile）虽不慢，但并发下每请求一份对象 +
+    每次 compile 都重新绑定节点，没有任何收益。图无状态（无 checkpointer），
+    单例复用是安全的；测试要新图时直接调 build_rag_graph()。
+    """
     global _graph
     if _graph is None:
         _graph = build_rag_graph()
-    final = await _graph.ainvoke(
+    return _graph
+
+
+async def ask(question: str, session_id: str = "default") -> dict:
+    """问一次：驱动状态机跑到底，返回最终状态（含拒答）。"""
+    graph = get_rag_graph()
+    final = await graph.ainvoke(
         {
             "question": question,
             "session_id": session_id,

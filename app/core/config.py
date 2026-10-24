@@ -50,6 +50,9 @@ class Settings(BaseSettings):
 
     # ---- 检索 ----
     retrieve_top_k: int = 8
+    # FR-5：ONNX 查询推理是否放线程池。默认开；保留开关用于压测 A/B
+    # （关掉即旧行为：同步推理阻塞事件循环，并发 P95 会明显恶化）
+    embed_in_thread: bool = True
     # 融合权重：向量路管语义相关，关键词路管实体精确。初始 6:4，
     # D6 评测数据说话后调（mock 模式向量是噪声，自动降为 0——见 retrieve.py）
     vector_weight: float = 0.6
@@ -65,6 +68,30 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://api.deepseek.com"
     llm_api_key: str = ""
     llm_model: str = "deepseek-chat"
+
+    # ---- Redis / API 安全（FR-8）----
+    redis_url: str = "redis://localhost:6379/0"
+    api_keys: str = "dev-key-001"          # 逗号分隔白名单；空 = 不鉴权（仅本地）
+    rate_limit_per_min: int = 20           # 每 key 每分钟令牌数（Lua 原子桶）
+    # CORS 收紧到前端源：dev 是 Vite 5173；生产由 CORS_ORIGINS 覆盖
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+
+    # ---- Langfuse 可观测（留空自动降级为本地日志）----
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://us.cloud.langfuse.com"
+
+    @property
+    def api_key_set(self) -> set[str]:
+        return {k.strip() for k in self.api_keys.split(",") if k.strip()}
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def langfuse_enabled(self) -> bool:
+        return bool(self.langfuse_public_key and self.langfuse_secret_key)
 
 
 @lru_cache

@@ -64,6 +64,7 @@ def test_sse_does_not_run_graph_twice():
         with TestClient(api_main.app) as client, client.stream(
             "POST", "/ask",
             json={"question": fact.question, "session_id": "sse-single-run"},
+            headers={"X-API-Key": "dev-key-001"},
         ) as resp:
             assert resp.status_code == 200
             events = []
@@ -80,3 +81,29 @@ def test_sse_does_not_run_graph_twice():
     terminal = [e for e in events if e.get("event") in ("answer", "refuse")][-1]
     if terminal["event"] == "answer":
         assert "citations" in terminal
+
+
+def test_sse_整体超时返回错误终态(monkeypatch):
+    """FR-5：图挂住超过 SSE_TIMEOUT_S 时必须给前端 error 终态，不能永远挂着。"""
+    from app.api import main as api_main
+
+    class SlowGraph:
+        async def astream(self, *_args, **_kwargs):
+            await asyncio.sleep(5)
+            yield ("values", {})
+
+    monkeypatch.setattr(api_main, "get_rag_graph", lambda: SlowGraph())
+    monkeypatch.setattr(api_main, "SSE_TIMEOUT_S", 0.05)
+
+    with TestClient(api_main.app) as client, client.stream(
+        "POST", "/ask", json={"question": "任意问题", "session_id": "sse-timeout"},
+        headers={"X-API-Key": "dev-key-001"},
+    ) as resp:
+        events = [
+            json.loads(line[6:])
+            for line in resp.iter_lines()
+            if line.startswith("data: ")
+        ]
+    errors = [e for e in events if e.get("event") == "error"]
+    assert errors, events
+    assert "超时" in errors[0].get("detail", "")

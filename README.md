@@ -103,7 +103,7 @@ frontend/
   tests/              50 项 vitest 单测（断帧重组/CRLF/多帧粘包/事件机/快照语义/组件与外壳冒烟）
 scripts/load_test.py 压测（含 SOCKS 代理选项）
 deploy/postgres/init/ 实例级扩展（vector + pg_trgm）
-tests/                64 个测试：分块不变量/向量契约/语料合法性/检索集成/校验器/充分性守卫位置/SSE 单跑回归
+tests/                102 个测试：分块（含表格）/向量契约/语料合法性/检索集成/校验器（边界+单位+多引用）/守卫（独立词典）/评测隔离/API 安全/SSE
 ```
 
 ## 3. 设计决策日志（ADR）
@@ -151,6 +151,7 @@ tests/                64 个测试：分块不变量/向量契约/语料合法�
 | D6 | 评测闭环（36 测试）+ 压测 | ✅ |
 | D13 | 评测可信度重构：分级基准 + 实体锚定 + 充分性守卫（62 测试） | ✅ |
 | D13+ | 守卫位置修正：`check_sufficiency` 独立成节点（检索后、生成前）+ 拒答不重试（62 → **64** 测试：+1 守卫位置探针 +1 拒答路由） | ✅ |
+| FR-2/3/5/7/8 | 守卫独立词典 + 评测库隔离/逐题明细 + 表格感知分块 + 校验/改写收紧 + 并发/SSE 超时 + API Key/限流/CORS/Langfuse（**102** 测试） | ✅ |
 | D7 | 与 DataCrew 一起收尾（CI/架构图/简历数字核验） | 待办 |
 
 ## 4.5 评测结果（D13 分级，可复现）
@@ -234,6 +235,55 @@ answer_accuracy 63.3% → 100% 的修复过程（评测驱动，每个数字可�
    实体问法的语料，那是下一步工作（已列入工程文档）。
 3. answer_accuracy 依赖 LLM 遵循"带引用、用证据内的数字"的指令，真实模式下
    会随模型波动——多种子跑法的意义就是让这个波动显形（均值 ± 极差）。
+
+## 4.6 工程化改造（FR-2/3/5/7/8，2026-10-25）
+
+这一轮解决的是"**评测可信度**与**生产可用性**"，不是继续刷分。逐项：
+
+| 项 | 改造前 | 改造后 | 证据 |
+|---|---|---|---|
+| 守卫判据（FR-2） | `sufficiency.py` import 出题清单 `corpus.UNSUPPORTED_METRICS`——拒答 100% 是循环论证 | 独立词典 `metric_lexicon.py`（只描述金融说法，不含题目/答案）；新增未来措辞守卫；AST 测试禁止 import corpus | `tests/test_sufficiency.py` 12 条 |
+| 评测隔离（FR-2） | `TRUNCATE rag.documents CASCADE` 清开发库 | 独立评测库 `finrag_eval`（由 DSN 派生，自动建库）；开发库哨兵文档测试守住 | `tests/test_eval_isolation.py` 4 条 |
+| 逐题明细（FR-2） | `per_fact` 只有 tier_sizes | 每题记录 fact/tier/命中/top-k 来源/答案/status/拒答原因；拒答与污染档也落库 | 同上 |
+| 拒绝质量（FR-2） | 只报拒答率 | 误拒率（exact/paraphrase）与漏拒率分开报 | 评测输出 `guard_false_reject` / `refusal_miss_rate` |
+| 表格分块（FR-3） | 超大表格进句子滑窗、表头丢失、文末 kind=text | 表格按行组切分 + 每子块重复表头 + kind=table + section_path | `tests/test_chunker.py` 10 条 |
+| 校验（FR-7） | 子串匹配（5 命中 56.4）、只取第一个 [cN] | 数字边界匹配 + 亿/万/% 单位归一 + 多引用联合核对 | `tests/test_verify.py` 13 条 |
+| 改写（FR-7） | 把 verdict.missing 的**幻觉数字**拼回查询 | 只用原问题 + 指标同义词典扩展 | `tests/test_graph_integration.py` |
+| 并发（FR-5） | ONNX 推理阻塞事件循环；/ask 每请求 build 图 | `asyncio.to_thread` 查询向量；进程级图单例；SSE 整体超时 | `tests/test_embeddings.py` / `test_rag_graph_是进程级单例` / `test_sse_整体超时…` |
+| LLM 重试（FR-5） | 所有异常重试 3 次（含 401/400） | 只重试超时/连接/429/5xx；401/400 立即失败 | `tests/test_llm_retry.py` |
+| API 安全（FR-8） | 无鉴权、限流、CORS `*`、异常原文回传 | `X-API-Key` 鉴权 + Redis Lua 令牌桶（429/Retry-After）+ CORS 收紧 + 错误编号脱敏 | `tests/test_api_security.py` 10 条 |
+| 可观测（FR-8） | Langfuse 配置存在但代码零引用 | 每次问答一条 trace，检索/守卫/生成/校验为 span；未配 key/云端故障自动降级 | 同上 |
+
+### 压测（FR-5，mock 模式 1/10/50/100/200）
+
+数据：38 篇 / 190 块（mock embedding），每档 100 请求，单 worker。
+"改造前"= `EMBED_IN_THREAD=false`（同步推理阻塞事件循环）；"改造后"= 默认。
+
+| 并发 | QPS 前 | QPS 后 | P50 前 | P50 后 | P95 后 | 错误率 |
+|---|---|---|---|---|---|---|
+| 1 | 44.1 | 48.5 | 21.9ms | 19.6ms | 22.0ms | 0% |
+| 10 | 196.5 | 151.3 | 51.0ms | 51.1ms | 208.7ms | 0% |
+| 50 | 194.7 | 197.6 | 226.0ms | 219.7ms | 335.0ms | 0% |
+| 100 | 178.3 | 186.0 | 463.8ms | 436.8ms | 531.3ms | 0% |
+| 200 | 191.2 | 205.5 | 395.1ms | 392.6ms | 476.0ms | 0% |
+
+**读法（诚实边界）**：mock embedding 是哈希计算，单次仅 0.06ms——to_thread
+在 mock 下几乎没有可见收益（差异在噪声内）。这个改造针对的是 `EMBEDDING_MODE=local`
+的真实 ONNX 推理（单次数十毫秒，会把整个事件循环卡住）；本地未下载模型，
+所以没有"真实 embedding 前/后"数字，不编造。mock 链路的 QPS 平台约 200，
+瓶颈是单 worker + 每请求的检索/校验计算，不是 DB。
+
+### 真实模型压测（FR-5，DeepSeek，每档 50 请求）
+
+| 并发 | QPS | P50 | P95 | 错误率 |
+|---|---|---|---|---|
+| 10 | 9.4 | 818.9ms | 1899.3ms | 0% |
+| 20 | 21.3 | 787.7ms | 1065.0ms | 0% |
+
+瓶颈是 DeepSeek 单次生成延迟（约 0.8s/次，一题一次生成），不是本地并发；
+QPS 随并发近似线性，说明事件循环没有被阻塞（to_thread + 全局图有效）。
+压测时把 `RATE_LIMIT_PER_MIN` 调到 1000 以测流水线容量；限流器本身
+（每 key 20/min + 429/Retry-After）由 `test_token_bucket_原子限流` 单独守。
 
 ## 5. 本地运行
 

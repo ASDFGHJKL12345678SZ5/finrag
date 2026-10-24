@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+
 import numpy as np
 
 from app.core.logging import get_logger
@@ -50,3 +52,14 @@ async def ingest_corpus(n_reports: int = 30, seed: int = 20260929) -> dict:
 
 def embed_query(query: str) -> np.ndarray:
     return get_embedder().embed([query])[0]
+
+
+async def embed_query_async(query: str) -> np.ndarray:
+    """embed_query 的线程池版本（FR-5）。
+
+    ONNX 推理是**同步 CPU 计算**，直接放在事件循环里会让整个 worker 在
+    每次检索时停摆几十到几百毫秒——并发请求全部排队（低并发测不出来，
+    /ask 并发一上来 P95 就炸）。用 asyncio.to_thread 把阻塞计算挪到默认
+    线程池，事件循环只负责等 Future。
+    """
+    return await asyncio.to_thread(embed_query, query)

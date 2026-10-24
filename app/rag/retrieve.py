@@ -139,11 +139,17 @@ async def hybrid_search(
     question: str, industry: str | None = None, top_k: int | None = None
 ) -> list[dict]:
     """向量 + 关键词并集召回后融合重排，返回带引用编号的 chunk 列表。"""
-    from app.rag.ingest import embed_query
+    from app.rag.ingest import embed_query, embed_query_async
 
     settings = get_settings()
     top_k = top_k or settings.retrieve_top_k
-    qv = embed_query(question)
+    # FR-5：ONNX 推理放线程池，不阻塞事件循环（同步版在并发下会把 worker 卡住）。
+    # embed_in_thread=False 保留旧行为，供压测 A/B 对照。
+    qv = (
+        await embed_query_async(question)
+        if settings.embed_in_thread
+        else embed_query(question)
+    )
     vector_rows = await store.vector_search(qv, top_k=settings.retrieve_top_k, industry=industry)
     # IDF 加权：稀有词（指标名）比常见词（公司名）更能定位到正确块——
     # 评测实测：没有 IDF 时问"归母净利润"捞回的是只写营业收入的概况块，

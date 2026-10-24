@@ -42,7 +42,7 @@ from app.rag.corpus import (
     build_corpus,
     build_hallucination_questions,
 )
-from app.rag.ingest import embed_query, ingest_report
+from app.rag.ingest import embed_query_async, ingest_report
 from app.rag.retrieve import detect_anchor, fuse
 from app.rag.sufficiency import REFUSAL_REASONS, check_sufficiency
 from app.rag.verify import verify_answer
@@ -98,7 +98,7 @@ async def _search_strategy(
     单路基线（vector_only/keyword_only）本就不带锚定——它们测的是
     单路能力；锚定是 hybrid 策略的一部分。
     """
-    qv = embed_query(question)
+    qv = await embed_query_async(question)
     v_rows = await store.vector_search(qv, top_k=top_k, industry=industry)
     if strategy == "vector_only":
         rows = v_rows

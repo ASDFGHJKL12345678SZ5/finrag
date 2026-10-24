@@ -4,6 +4,11 @@
 不同点：FinRAG 每个请求要走完整状态机（检索+生成+校验），
 且 mock 模式下没有 LLM 网络往返——压的是"状态机+检索"这条链路，
 真实 LLM 接入后要重新标定（README 会写清这个边界）。
+
+FR-5 修正：旧版 QPS 用 `total / (sum(lat)/1000/concurrency)` 计算——这只在
+"并发 worker 全程满载且延迟均匀"时近似成立，实际会随分位尾部指数高估。
+现在用墙钟：QPS = total / wall_s。档位按方案：mock 1/10/50/100/200，
+真实 10/20（可用 FINRAG_LOAD_LEVELS 覆盖）。
 """
 from __future__ import annotations
 
@@ -15,6 +20,9 @@ import time
 import httpx
 
 BASE = os.environ.get("FINRAG_BASE", "http://127.0.0.1:8001")
+# FR-8 起 /ask 需要 API Key；压测容量时用 RATE_LIMIT_PER_MIN 放大桶
+# （否则测到的是限流器——这与"测流水线"的目标不同，报告里会标注）
+API_KEY = os.environ.get("FINRAG_API_KEY", "dev-key-001")
 
 # 20 个不同问题轮询：避免同问题命中任何潜在缓存，也让检索分布真实
 QUESTIONS = [
@@ -48,7 +56,8 @@ async def _one(client: httpx.AsyncClient, q: str, sem: asyncio.Semaphore) -> tup
             r = await client.post(
                 BASE + "/ask/sync",
                 json={"question": q, "session_id": "loadtest"},
-                timeout=60,
+                headers={"X-API-Key": API_KEY},
+                timeout=120,
             )
             ok = r.status_code == 200 and r.json().get("status") in ("done", "insufficient")
         except Exception:  # noqa: BLE001 - 压测里任何异常都算失败，不能中断整轮
@@ -62,7 +71,9 @@ async def run(concurrency: int, total: int) -> dict:
         tasks = [
             _one(client, QUESTIONS[i % len(QUESTIONS)], sem) for i in range(total)
         ]
+        started = time.perf_counter()
         results = await asyncio.gather(*tasks)
+        wall_s = time.perf_counter() - started
     lat = sorted(r[0] for r in results)
     ok_n = sum(1 for r in results if r[1])
     return {
@@ -70,22 +81,29 @@ async def run(concurrency: int, total: int) -> dict:
         "total": total,
         "ok": ok_n,
         "failed": total - ok_n,
-        "qps": round(total / (sum(lat) / 1000 / concurrency), 1) if lat else 0,
+        "error_rate": round((total - ok_n) / total, 4) if total else 0,
+        "wall_s": round(wall_s, 2),
+        "qps": round(total / wall_s, 1) if wall_s else 0,
         "p50_ms": round(statistics.median(lat), 1),
-        "p95_ms": round(lat[int(len(lat) * 0.95)], 1),
+        "p95_ms": round(lat[min(int(len(lat) * 0.95), len(lat) - 1)], 1),
         "max_ms": round(lat[-1], 1),
     }
 
 
 def main() -> None:
     total = int(os.environ.get("FINRAG_LOAD_TOTAL", "100"))
-    print(f" FinRAG 压测（base={BASE}, 每档 {total} 请求）")
-    for c in (1, 5, 10, 20):
+    levels = [
+        int(x) for x in os.environ.get("FINRAG_LOAD_LEVELS", "1,10,50,100,200").split(",")
+        if x.strip()
+    ]
+    print(f" FinRAG 压测（base={BASE}, 每档 {total} 请求, 并发档 {levels}）")
+    for c in levels:
         row = asyncio.run(run(c, total))
         print(
-            f"  并发 {row['concurrency']:>2}: QPS {row['qps']:>6} | "
-            f"P50 {row['p50_ms']:>7}ms | P95 {row['p95_ms']:>7}ms | "
-            f"Max {row['max_ms']:>7}ms | 失败 {row['failed']}"
+            f"  并发 {row['concurrency']:>3}: QPS {row['qps']:>6} | "
+            f"P50 {row['p50_ms']:>8}ms | P95 {row['p95_ms']:>8}ms | "
+            f"Max {row['max_ms']:>8}ms | 错误率 {row['error_rate']:.1%} "
+            f"| 墙钟 {row['wall_s']}s"
         )
 
 

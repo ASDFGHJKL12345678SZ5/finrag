@@ -38,3 +38,12 @@ def test_零向量不除零():
     arr = np.zeros((2, 4), dtype=np.float32)
     out = _l2_normalize(arr)
     assert np.all(np.isfinite(out))
+
+
+async def test_异步查询向量与同步一致():
+    """FR-5：to_thread 版本只是把同一计算挪出事件循环，结果必须逐位一致。"""
+    from app.rag.ingest import embed_query, embed_query_async
+
+    sync_vec = embed_query("宁德润能2025年营业收入")
+    async_vec = await embed_query_async("宁德润能2025年营业收入")
+    assert np.array_equal(sync_vec, async_vec)

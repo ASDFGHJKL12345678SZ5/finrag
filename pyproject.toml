@@ -21,6 +21,8 @@ dependencies = [
     "tenacity>=8.2",              # 重试
     "langgraph>=0.2",             # 问答状态机编排
     "openai>=1.40",               # DeepSeek/Qwen 均 OpenAI 兼容
+    "redis>=5.0",                 # API Key 限流（Lua 令牌桶，FR-8）
+    "langfuse>=2.60,<3",          # 问答级 trace/span（未配 key 自动降级，FR-8）
 ]
 
 [project.optional-dependencies]

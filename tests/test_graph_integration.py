@@ -96,6 +96,13 @@ def test_rewrite_query_用指标同义词扩展():
     assert "营业收入" in q, f"改写没有做指标同义扩展: {q}"
 
 
+def test_rag_graph_是进程级单例():
+    """FR-5：/ask 每请求 build_rag_graph() 是纯浪费；单例必须稳定复用。"""
+    from app.rag.graph import get_rag_graph
+
+    assert get_rag_graph() is get_rag_graph()
+
+
 def test_空检索时verify判insufficient而不是崩溃():
     """检索为空 -> verify 守卫直接判 insufficient（最终审查修复）。
 

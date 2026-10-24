@@ -1,4 +1,4 @@
-// FinRAG 后端客户端（无鉴权；CORS 后端已放开，dev 仍走 proxy）。
+// FinRAG 后端客户端（X-API-Key 鉴权；CORS 后端收紧到前端源，dev 仍走 proxy）。
 import { createSseParser, type SseFrame } from './sse'
 import type { RagEvent } from '@/types/events'
 
@@ -13,6 +13,10 @@ export class ApiError extends Error {
  *  导出它是为了让健康探测（useHealth）打到同一个后端。 */
 export const API_BASE: string = import.meta.env.VITE_API_BASE ?? ''
 
+/** API Key（FR-8）：dev 默认与后端 .env.example 的 dev-key-001 对齐；
+ *  生产由 VITE_API_KEY 注入，绝不把真实 key 写进仓库。 */
+const API_KEY: string = import.meta.env.VITE_API_KEY ?? 'dev-key-001'
+
 export async function* askStream(
   question: string,
   sessionId: string,
@@ -20,7 +24,7 @@ export async function* askStream(
 ): AsyncGenerator<RagEvent> {
   const res = await fetch(API_BASE + '/ask', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
     body: JSON.stringify({ question, session_id: sessionId }),
     signal,
   })
