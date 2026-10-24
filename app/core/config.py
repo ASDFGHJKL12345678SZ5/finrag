@@ -50,6 +50,10 @@ class Settings(BaseSettings):
 
     # ---- 检索 ----
     retrieve_top_k: int = 8
+    # FR-6 融合策略：minmax（当前默认）/ rrf / rrf_rerank
+    fusion_strategy: str = "minmax"
+    rerank_model: str = "BAAI/bge-reranker-base"
+    rerank_candidates: int = 20
     # FR-5：ONNX 查询推理是否放线程池。默认开；保留开关用于压测 A/B
     # （关掉即旧行为：同步推理阻塞事件循环，并发 P95 会明显恶化）
     embed_in_thread: bool = True

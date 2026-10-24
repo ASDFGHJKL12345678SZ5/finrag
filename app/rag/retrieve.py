@@ -50,6 +50,60 @@ def detect_anchor(question: str, companies: list[str]) -> str | None:
     return max(hits, key=len)
 
 
+def rrf_fuse(
+    vector_rows: list[dict],
+    keyword_rows: list[dict],
+    vector_weight: float = 0.6,
+    keyword_weight: float = 0.4,
+    k: int = 60,
+    max_per_source: int = 2,
+    anchor: str | None = None,
+) -> list[dict]:
+    """Reciprocal Rank Fusion（FR-6）：按**名次**融合，不依赖两路分数量纲。
+
+    为什么需要它：min-max 加权直接把两路分数归一后相加，而向量余弦与 BM25
+    的量纲/分布完全不同（BM25 无上界、余弦集中在 0.3-0.7），一路的分差会被
+    另一路吞掉。RRF 只看 rank：score = Σ weight/(k + rank)，k=60 是原论文
+    默认值（抑制头部极端名次）。实体锚定与同文档限流仍复用同一套逻辑。
+    """
+    scores: dict[tuple[str, int], float] = {}
+    merged: dict[tuple[str, int], dict] = {}
+    routes = (
+        ("vector", vector_rows, vector_weight),
+        ("keyword", keyword_rows, keyword_weight),
+    )
+    for route, rows, weight in routes:
+        for rank, row in enumerate(rows, 1):
+            key = (row["source"], row["chunk_index"])
+            contribution = weight / (k + rank)
+            scores[key] = scores.get(key, 0.0) + contribution
+            if key in merged:
+                merged[key]["via"].append(route)
+            else:
+                item = dict(row)
+                item["via"] = [route]
+                merged[key] = item
+
+    for key, item in merged.items():
+        item["score"] = scores[key]
+
+    if anchor:
+        for item in merged.values():
+            if anchor in item["source"]:
+                item["score"] *= COMPANY_ANCHOR_BOOST
+
+    ranked = sorted(merged.values(), key=lambda r: r["score"], reverse=True)
+    per_source: dict[str, int] = {}
+    out: list[dict] = []
+    for item in ranked:
+        n = per_source.get(item["source"], 0)
+        if n >= max_per_source:
+            continue
+        per_source[item["source"]] = n + 1
+        out.append(item)
+    return out
+
+
 def fuse(
     vector_rows: list[dict],
     keyword_rows: list[dict],
@@ -154,7 +208,21 @@ async def hybrid_search(
     # 实体锚定（D13）：问题点到哪家公司，就给该公司的块加分——
     # 易混公司对共享前缀，纯词面打分会混排；完整实体名是可靠判别依据
     anchor = detect_anchor(question, await store.company_names())
-    ranked = fuse(vector_rows, keyword_rows, vector_weight=vw, keyword_weight=kw, anchor=anchor)
+    strategy = settings.fusion_strategy.lower()
+    if strategy in ("rrf", "rrf_rerank"):
+        ranked = rrf_fuse(
+            vector_rows, keyword_rows,
+            vector_weight=vw, keyword_weight=kw, anchor=anchor,
+        )
+        if strategy == "rrf_rerank":
+            from app.rag.rerank import rerank
+
+            ranked = rerank(question, ranked, top_n=top_k)
+    else:
+        ranked = fuse(
+            vector_rows, keyword_rows,
+            vector_weight=vw, keyword_weight=kw, anchor=anchor,
+        )
 
     # 引用编号 c1..cN：生成阶段强制带编号，校验阶段按编号回溯证据
     for i, item in enumerate(ranked[:top_k]):
@@ -164,6 +232,7 @@ async def hybrid_search(
         extra={"context": {
             "vector": len(vector_rows), "keyword": len(keyword_rows),
             "fused": len(ranked[:top_k]), "industry": industry,
+            "strategy": strategy,
         }},
     )
     return ranked[:top_k]
