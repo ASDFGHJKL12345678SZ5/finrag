@@ -144,6 +144,28 @@ def test_company_names包含简称与缩写():
     _run(body)
 
 
+def test_指标同义词扩词命中财务块():
+    """问"营收"（不是"营业收入"）时，扩词必须把营收块排到现金流块前面。
+
+    FR-1 的 synonym 档就是靠这一条：不扩词时 BM25 只匹配公司名/年份，
+    短小的现金流体靠长度归一化反超，答案"有据可依"但答错指标。
+    """
+
+    async def body():
+        await _seed_source(texts=[
+            "2025年公司营业收入518.75亿元，同比增长13.1%。",
+            "2025年经营性现金流净额106.82亿元，与净利润规模基本匹配。",
+            "公司总部位于上海。",
+        ])
+        rows = await store.keyword_search("宁德润能2025年的营收是多少", top_k=3)
+        assert rows
+        assert "营业收入" in rows[0]["text"], (
+            f"扩词后营收块应排第一，实际: {rows[0]['text'][:60]}"
+        )
+
+    _run(body)
+
+
 def test_reset_lexical_index清空统计():
     async def body():
         await _seed_source()

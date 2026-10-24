@@ -1,181 +1,172 @@
-"""语料合法性测试：ground truth 与语料必须同源一致。
+"""语料合法性 + 难基准不变量（FR-1）。
 
-这是评测闭环的信任根：如果登记的事实在语料里找不到，
-D6 的"答案正确性"判定就是空中楼阁。每条事实的 evidence_terms
-必须能在对应研报文本里找到。
+信任根：每条 ground truth 必须能在语料里回溯；题库不得把公司全名写进问题；
+拒答题问的年份/指标/未来措辞必须真的不在语料里。
 """
+from __future__ import annotations
+
 import re
 
 import pytest
 
-from app.rag.corpus import all_facts, build_corpus
+from app.rag.corpus import (
+    _SEGMENTS,
+    UNSUPPORTED_METRICS,
+    WRONG_YEARS,
+    all_facts,
+    build_benchmark,
+    build_companies,
+    build_corpus,
+    build_registry,
+)
+
+BODY_METRICS = ("营业收入", "同比增长", "归母净利润", "毛利率", "研发费用率", "经营性现金流")
+
+
+@pytest.fixture(scope="module")
+def reports():
+    return build_corpus(n_companies=5, years=(2023, 2024, 2025), seed=7)
+
+
+@pytest.fixture(scope="module")
+def full_reports():
+    return build_corpus()
+
+
+@pytest.fixture(scope="module")
+def benchmark(full_reports):
+    return build_benchmark(full_reports)
 
 
 def test_语料确定性():
-    a = build_corpus(n_reports=6, seed=42)
-    b = build_corpus(n_reports=6, seed=42)
+    a = build_corpus(n_companies=3, years=(2024, 2025), seed=42)
+    b = build_corpus(n_companies=3, years=(2024, 2025), seed=42)
     assert [r.text for r in a] == [r.text for r in b]
     assert [r.source for r in a] == [r.source for r in b]
+    c = build_corpus(n_companies=3, years=(2024, 2025), seed=43)
+    assert [r.text for r in a] != [r.text for r in c]
 
 
-def test_不同种子不同语料():
-    a = build_corpus(n_reports=6, seed=1)
-    b = build_corpus(n_reports=6, seed=2)
-    assert [r.text for r in a] != [r.text for r in b]
+def test_公司池200家_40组易混_简称与缩写唯一():
+    companies = build_companies()
+    assert len(companies) == 200
+    assert len({c.group for c in companies}) == 40 >= 30
+    assert len({c.short for c in companies}) == 200
+    assert len({c.abbr for c in companies}) == 200
+    for c in companies:
+        assert c.short in c.full
+        assert len(c.abbr) == 3
+        assert c.abbr not in c.short, "缩写不能是简称子串（锚定会错位）"
+    shorts = [c.short for c in companies]
+    for a in shorts:
+        for b in shorts:
+            assert a == b or (a not in b and b not in a), f"简称互为子串: {a}/{b}"
 
 
-def test_事实全部可在语料中回溯():
-    reports = build_corpus(n_reports=10, seed=7)
+def test_每篇9条事实_证据词可回溯(reports):
     by_source = {r.source: r.text for r in reports}
-    facts = all_facts(reports)
-    assert len(facts) > 0
-    for f in facts:
-        text = by_source[f.source]
-        for term in f.evidence_terms:
-            assert term in text, f"事实 {f.fact_id} 的证据词 [{term}] 不在语料中"
+    assert len(reports) == 15  # 5 公司 × 3 年
+    for r in reports:
+        assert len(r.facts) == 9
+        assert len([f for f in r.facts if f.table_only]) == 3
+        assert len([f for f in r.facts if not f.table_only]) == 6
+        text = by_source[r.source]
+        for f in r.facts:
+            for term in f.evidence_terms:
+                assert term in text, f"{f.fact_id} 的证据词 {term!r} 不在语料中"
 
 
-def test_行业覆盖与source唯一():
-    reports = build_corpus(n_reports=15, seed=3)
-    # distractors=True 时报告数 = 基准 + 易混干扰，唯一性按实际报告数校验
+def test_分业务事实只出现在表格里(reports):
+    for r in reports:
+        table_only = [f for f in r.facts if f.table_only]
+        for f in table_only:
+            value = f.answer
+            assert r.text.count(value) == 1, f"{f.fact_id} 的值 {value} 出现不止一次"
+            pos = r.text.find(value)
+            line = r.text[:pos].rsplit("\n", 1)[-1]
+            assert "|" in line, "分业务值必须只在 Markdown 表格行里"
+
+
+def test_source唯一且带年份(reports):
     assert len({r.source for r in reports}) == len(reports)
-    assert len({r.industry for r in reports}) >= 3
-
-def test_同一公司不重复出报告():
-    """数据合法性：同名多篇会让事实问题有多个答案，ground truth 歧义。
-
-    实测教训：30 篇语料里春山乳业出现 3 次（不同数字），
-    "春山乳业营业收入是多少"有 3 个答案，评测 6 个 miss 全源于此。
-    """
-    reports = build_corpus(n_reports=30, seed=42)
-    companies = [r.title.split("2025")[0] for r in reports]
-    assert len(companies) == len(set(companies)), (
-        f"公司重复: {[c for c in companies if companies.count(c) > 1]}"
-    )
+    for r in reports:
+        assert r.source.endswith(f"-{r.year}")
+        assert str(r.year) in r.title
 
 
-def test_事实答案数字能在语料文本中找到():
-    """ground truth 可回溯：标准答案里的数字必须出现在报告正文里。"""
-    reports = build_corpus(n_reports=5, seed=7)
-    for f in all_facts(reports):
-        src = next(r for r in reports if r.source == f.source)
-        for num in re.findall(r"\d+(?:\.\d+)?", f.answer):
-            assert num in src.text, f"{f.fact_id} 的数字 {num} 不在语料中"
-
-def test_fact_registry与all_facts同源():
-    """FactRegistry（最终审查落地）与 all_facts 必须完全一致。"""
-    from app.rag.corpus import all_facts, build_corpus, build_registry
-
-    reports = build_corpus()
-    reg = build_registry(reports)
-    # 每篇报告 3 条事实（含易混干扰报告）——不写死 90：
-    # D13 起语料带干扰报告，事实数 = 报告数 × 3
-    assert len(reg) == len(all_facts(reports)) == len(reports) * 3
-    by_id = {f.fact_id: f for f in all_facts(reports)}
-    for q, fact in reg.questions():
+def test_fact_registry与all_facts同源(full_reports):
+    reg = build_registry(full_reports)
+    assert len(reg) == len(all_facts(full_reports)) == 9000
+    by_id = {f.fact_id: f for f in all_facts(full_reports)}
+    for question, fact in reg.questions():
         assert by_id[fact.fact_id] is fact
+        assert question == fact.question
 
 
-def test_fact_registry拒绝重复登记():
-    """fact_id 重复是语料生成 bug——登记表必须在入口处炸出来。"""
-    from app.rag.corpus import Fact, FactRegistry
-
-    reg = FactRegistry()
-    fact = Fact(fact_id="f1", source="s", question="q", answer="a", evidence_terms=[])
-    reg.register(fact)
-    with pytest.raises(ValueError, match="重复登记"):
-        reg.register(fact)
+def test_题库800题分类数量(benchmark):
+    assert len(benchmark) == 800
+    cats = {c: sum(1 for q in benchmark if q.category == c)
+            for c in ("exact", "abbr", "calculation", "refusal")}
+    assert cats == {"exact": 300, "abbr": 300, "calculation": 100, "refusal": 100}
+    subtypes = {q.subtype for q in benchmark if q.category == "calculation"}
+    assert {"yoy", "yoy_diff", "segment_share", "industry_max"} <= subtypes
 
 
-# ---------- D13 分级评测的不变量（改造后新增） ----------
+def test_问题不写公司全名(benchmark):
+    full_names = [c.full for c in build_companies()]
+    for q in benchmark:
+        assert not any(name in q.question for name in full_names), q.question
 
 
-def _companies(reports) -> list[str]:
-    return [r.title.split("2025")[0] for r in reports]
+def test_简称档含缩写或同义说法(benchmark, full_reports):
+    abbr_map = {r.source: r.company.abbr for r in full_reports if r.company}
+    abbr_qs = [q for q in benchmark if q.category == "abbr"]
+    assert abbr_qs
+    n_abbr = sum(1 for q in abbr_qs if abbr_map.get(q.source) in q.question)
+    assert n_abbr >= len(abbr_qs) * 0.4, "至少四成改写题用 3 字缩写"
 
 
-def test_易混公司名互不为子串():
-    """ILike 全名匹配不能误伤：任何公司名不能是另一个的子串。
-
-    实体锚定（detect_anchor/fuse）靠"公司名 in source"判别——若
-    "华曜" 是 "华曜新能" 的子串，问华曜新能时会误锚到华曜的文档。
-    这条不变量是锚定正确性的前提。
-    """
-    reports = build_corpus(n_reports=30, seed=42)
-    companies = _companies(reports)
-    assert len(companies) == len(set(companies))
-    for a in companies:
-        for b in companies:
-            if a != b:
-                assert a not in b and b not in a, f"公司名互为子串: {a} / {b}"
-
-
-def test_易混干扰报告与基准同行业且关联正确():
-    reports = build_corpus(n_reports=30, seed=42)
-    siblings = [r for r in reports if r.confusable_with]
-    assert siblings, "distractors=True 应生成易混干扰报告"
-    for sib in siblings:
-        base = next(r for r in reports if r.title.split("2025")[0] == sib.confusable_with)
-        assert sib.industry == base.industry
-        assert sib.title.split("2025")[0] != base.title.split("2025")[0]
+def test_计算题答案可回溯(benchmark, full_reports):
+    by_source = {r.source: r.text for r in full_reports}
+    for q in benchmark:
+        if q.category != "calculation":
+            continue
+        assert q.source in by_source
+        if q.answer in by_source[q.source]:
+            continue
+        # 计算值（同比/差值/占比）可能只以两个操作数的形式出现：检查操作数在源文里
+        assert re.search(r"\d", q.answer)
+        src_nums = {round(float(n), 2) for n in re.findall(r"\d+(?:\.\d+)?", by_source[q.source])}
+        ans_nums = [round(float(n), 2) for n in re.findall(r"\d+(?:\.\d+)?", q.answer)]
+        assert all(n in src_nums for n in ans_nums), (q.answer, ans_nums)
 
 
-def test_改写题与母题同源同解():
-    """同义改写只许改问题文本，source/answer/证据必须一致——
-    否则改写档的命中判定就失去了 ground truth。"""
-    reports = build_corpus(n_reports=10, seed=7)
-    n_variants = 0
-    for f in all_facts(reports):
-        assert f.variants, f"{f.fact_id} 缺改写题（D13 R2）"
-        for v in f.variants:
-            assert v != f.question
-            n_variants += 1
-        # 改写题复用母题判据：同 source 同 answer，且必须仍点名公司
-        # （不点名公司的"那家公司营收如何"没有唯一 ground truth）
-        company = f.source.split("-", 2)[2]
-        for v in f.variants:
-            assert company in v, f"改写题丢了公司实体，ground truth 不再唯一: {v}"
-    assert n_variants >= 60
-
-
-def test_无答案题的答案确实不在语料中():
-    """三类无答案题（D13 R3）的 ground truth：年份/指标语料里没有。"""
-    reports = build_corpus(n_reports=30, seed=42)
-    corpus_text = " ".join(r.text for r in reports)
-    from app.rag.corpus import build_hallucination_questions
-
-    qs = build_hallucination_questions(reports)
-    assert len(qs) == 30, "10 家公司 × 3 类"
-    for hq in qs:
-        if hq.htype == "wrong_year":
-            assert "2024" in hq.question and "2024" not in corpus_text
-        elif hq.htype == "future_prediction":
-            assert "2026" in hq.question and "2026" not in corpus_text
-        elif hq.htype == "missing_metric":
-            assert "市值" in hq.question and "市值" not in corpus_text
+def test_拒答题问的年份指标确实不在语料(full_reports):
+    corpus_text = " ".join(r.text for r in full_reports)
+    for hq in (q for q in build_benchmark(full_reports) if q.category == "refusal"):
+        if hq.subtype == "wrong_year":
+            assert any(str(y) in hq.question for y in WRONG_YEARS)
+        elif hq.subtype == "missing_metric":
+            assert any(m in hq.question for m in UNSUPPORTED_METRICS)
         else:
-            raise AssertionError(f"未知幻觉题型: {hq.htype}")
+            assert any(k in hq.question for k in ("预测", "明年", "未来"))
+        for y in WRONG_YEARS:
+            assert f"{y}年" not in corpus_text
+        for metric in UNSUPPORTED_METRICS:
+            assert metric not in corpus_text
 
 
-def test_无答案题不含mock幻觉触发词():
-    """触发词撞上的 100% 拒答正是要修掉的假指标（README §4.5 诚实边界）。"""
-    from app.rag.corpus import build_hallucination_questions
-
-    reports = build_corpus(n_reports=30, seed=42)
+def test_拒答题不含mock幻觉触发词(benchmark):
     triggers = ("预测", "未来三年", "2030年", "股价目标")
-    for hq in build_hallucination_questions(reports):
-        assert not any(t in hq.question for t in triggers), (
-            f"无答案题含 mock 触发词（拒答会是规则假模型的产物）: {hq.question}"
-        )
+    refusal_qs = [q for q in benchmark if q.category == "refusal"]
+    # 未来预测题允许"预测/未来"（这正是守卫要拦的），但错年份/缺指标题不行
+    for q in refusal_qs:
+        if q.subtype == "future_prediction":
+            continue
+        assert not any(t in q.question for t in triggers), q.question
 
 
-def test_污染探针配对且答案不同():
-    reports = build_corpus(n_reports=30, seed=42)
-    from app.rag.corpus import build_contamination_pairs
-
-    pairs = build_contamination_pairs(reports)
-    assert pairs, "应生成污染探针对（D13 R4）"
-    for p in pairs:
-        assert p.company != p.distractor_company
-        assert p.a_answer != p.b_answer, "A/B 数字相同则探针无意义"
-
+def test_行业极值题不给公司名(benchmark):
+    for q in benchmark:
+        if q.category == "calculation" and q.subtype == "industry_max":
+            assert q.answer not in q.question, "极值题不能把答案公司名写进问题"

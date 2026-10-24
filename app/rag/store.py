@@ -362,12 +362,43 @@ async def keyword_search(
     - N / 平均块长取自 `corpus_stats` 单行表，查询期零 count(*)
     - weights 只保留领域加权（指标词 ×2），IDF 由 BM25 的 df 直接算
     """
-    terms = _extract_terms(query)[:12]
+    terms = _extract_terms(query, limit=12)
     if not terms:
         return []
+    # 指标同义词扩词（FR-1）：问"营收"时把"营业收入/总收入…"也作为检索词，
+    # 否则 BM25 的字面匹配会漏掉只写"营业收入"的财务块
+    from app.rag.metric_lexicon import METRIC_GROUPS, expand_metric_terms
+
+    # 指标词加权：问题命中某指标组时，该组全部说法（含 2 字二元组）权重 ×3。
+    # 公司名/年份只能定位文档，指标才定位到回答问题的块——不加权时短小的
+    # 现金流块靠长度归一化压过营收块（FR-1 实测 synonym 档 answer 71%）。
+    metric_terms: set[str] = set()
+    for canonical, synonyms in METRIC_GROUPS.items():
+        if any(s in query for s in synonyms):
+            for s in (canonical, *synonyms):
+                metric_terms.update(_extract_terms(s, limit=12))
+    # "占比/比重/份额"类问题要的是分业务表（表头含"业务板块/收入/占比"），
+    # 先加这些词再扩指标同义词——否则 24 词上限会被营收同义词占满，
+    # 分业务表反而排到第 12 名（FR-1 实测 segment_share 8/20）
+    if any(k in query for k in ("占比", "比重", "份额")):
+        for term in _extract_terms("占比 比重 业务 板块", limit=16):
+            if term not in terms:
+                terms.append(term)
+        metric_terms.update(_extract_terms("占比 比重 业务 板块", limit=16))
+
+    for extra in expand_metric_terms(query):
+        # 索引按 2 字二元组建词（中文整段切分不可靠）：扩词也要拆成二元组，
+        # 否则"营业收入"整词没有 posting，扩了等于没扩
+        for term in _extract_terms(extra, limit=12):
+            if term not in terms:
+                terms.append(term)
+    terms = terms[:36]
     weights = weights or {}
     term_list = list(dict.fromkeys(terms))
-    term_weights = [float(weights.get(t, 1.0)) for t in term_list]
+    term_weights = [
+        float(weights.get(t, 1.0)) * (3.0 if t in metric_terms else 1.0)
+        for t in term_list
+    ]
     pool = get_pool()
     async with pool.acquire() as conn:
         stats = await conn.fetchrow(

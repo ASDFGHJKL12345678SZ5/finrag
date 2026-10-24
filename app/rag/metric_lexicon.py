@@ -68,6 +68,23 @@ def metric_terms_in(text: str) -> list[tuple[str, tuple[str, ...]]]:
     return hits
 
 
+def expand_metric_terms(text: str) -> list[str]:
+    """把问题里的指标说法扩成该组的全部词（FR-1 检索用）。
+
+    为什么需要：语料正文写"营业收入"，问题可能写"营收/总收入/收入总额"。
+    BM25 是字面匹配，"营收"并不是"营业收入"的连续子串——不扩词就会捞到
+    同公司的现金流块（实体命中、指标没命中），答案错得"有据可依"。
+    只扩**问题里已出现的指标组**，不做整句改写，避免引入无关词。
+    """
+    out: list[str] = []
+    for canonical, synonyms in METRIC_GROUPS.items():
+        if any(s in text for s in synonyms):
+            for term in (canonical, *synonyms):
+                if term not in out:
+                    out.append(term)
+    return out
+
+
 def unsupported_terms_in(text: str) -> list[str]:
     return [term for term in UNSUPPORTED_METRICS if term in text]
 

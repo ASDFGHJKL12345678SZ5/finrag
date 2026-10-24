@@ -250,7 +250,7 @@ def test_拒答路由不重试():
 
 
 def test_错年份问题被充分性守卫拒答():
-    """D13 R7：问 2024 年（语料只有 2025）——不带任何 mock 触发词，
+    """D13 R7：问 2019 年（语料 2021–2025，多表也只回溯到 2021）——不带触发词，
     旧实现会拿 2025 的数据硬答；守卫必须拒答。
 
     "在生成前"这一条由 test_sufficiency_refusal_skips_generate 单独守死，
@@ -259,7 +259,7 @@ def test_错年份问题被充分性守卫拒答():
     async def body():
         reports = await _reset_and_seed(10, 42)
         company = reports[0].title.split("2025")[0]
-        final = await ask(f"{company}2024年的营业收入是多少？")
+        final = await ask(f"{company}2019年的营业收入是多少？")
         assert final["status"] == "insufficient"
         assert final["refusal_reason"] == "year_not_in_evidence"
 

@@ -39,7 +39,7 @@ def _reset_and_seed(n: int = 10, seed: int = 42):
             pool = store.get_pool()
             async with pool.acquire() as conn:
                 await conn.execute("TRUNCATE rag.documents CASCADE")
-        await store.reset_lexical_index()
+            await store.reset_lexical_index()
             reports = build_corpus(n_reports=n, seed=seed)
             for r in reports:
                 await ingest_report(r)

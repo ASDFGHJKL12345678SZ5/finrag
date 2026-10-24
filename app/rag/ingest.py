@@ -25,19 +25,29 @@ async def ingest_report(report: Report) -> int:
         log.warning("ingest.empty", extra={"context": {"source": report.source}})
         return 0
     vectors = get_embedder().embed([c.text for c in chunks])
+    company = report.company
+    meta = (
+        {"abbr": company.abbr, "short": company.short, "code": company.code}
+        if company is not None
+        else {}
+    )
     await store.upsert_document(
         source=report.source,
         title=report.title,
         industry=report.industry,
         report_date=report.report_date,
-        meta={},
+        meta=meta,
     )
     return await store.upsert_chunks(chunks, vectors)
 
 
-async def ingest_corpus(n_reports: int = 30, seed: int = 20260929) -> dict:
-    """整库入库。返回统计（报告数/块数/事实数）。"""
-    reports = build_corpus(n_reports=n_reports, seed=seed)
+async def ingest_corpus(
+    n_companies: int = 200,
+    years: tuple[int, ...] | None = None,
+    seed: int = 20260929,
+) -> dict:
+    """整库入库（默认 200 公司 × 5 年 = 1000 篇）。返回统计。"""
+    reports = build_corpus(n_companies=n_companies, years=years, seed=seed)
     total_chunks = 0
     for report in reports:
         total_chunks += await ingest_report(report)

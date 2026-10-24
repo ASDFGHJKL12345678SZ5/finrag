@@ -1,65 +1,52 @@
-"""评测闭环：FactRegistry 驱动的分级指标 + 分策略对比 + 落库。
+"""评测 runner（FR-1 难基准）：800 题 × 多检索策略 + 端到端 + 独立评测库。
 
-D13 重构（为什么早期"全是 100%"必须改）：
-早期评测集与语料同源到没有难度——问题里公司名逐字出现、指标逐字出现，
-关键词检索（trigram 子串）必然全中：recall@5=100% 是**结构性必然**，
-不是系统能力，写进简历等于自曝其假。真实系统的 recall@5 到不了 100%，
-因为真实问题有同义改写、有易混实体、有语料覆盖不到的东西。
+评测跑在独立库 `finrag_eval`（`app/eval/db.py`），不再 TRUNCATE 开发库。
+题库由 `corpus.build_benchmark` 从 FactRegistry 同源派生：
+    exact 300 / abbr 300 / calculation 100 / refusal 100
 
-重构后的指标分四档，每档的判据全部可回溯到 FactRegistry：
-1. exact       原题（公司名+指标逐字）——**管线自检档**：接近 100% 是
-               这类基准的结构属性（小语料+实体逐字出现），诚实标注，
-               不作为质量声明
-2. paraphrase  同义改写题（"营业收入"→"总收入"）——考检索的语义能力
-3. refusal     三类无答案题（错年份/语料外指标/未来预测）——考拒答，
-               全部不含 mock 幻觉触发词，mock 与真实模式同一判据
-4. contamination 跨公司污染探针（问 A 不能答出 B）——考实体判别，
-               带锚定消融（anchor off/on）证明增益来源
-
-分策略对比（检索策略的 before/after）：
-- vector_only：只用向量路（mock 模式下等价随机基线——诚实标注）
-- keyword_only：只用关键词路
-- hybrid：两路融合 + 实体锚定（系统当前策略）
-同一批事实、同一 top-k，三个策略各自的命中率并排给出。
+检索策略（FR-6）：vector_only / keyword_only / hybrid(min-max) / rrf /
+rrf_rerank（本地 bge-reranker-base，模型缺失自动降级）。指标按题档报告
+recall@5、证据块命中、MRR；端到端按题档报告 answer_accuracy 与拒答率，
+守卫误拒与漏拒分开报告。逐题明细进 `per_fact.items`，可下钻到每条 miss。
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
 import re
+import statistics
+import sys
 import time
+from collections import defaultdict
 from datetime import UTC, datetime
+from typing import Any
+
+os.environ.setdefault("EMBEDDING_MODE", "mock")
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.winloop import ensure_selector_loop
 from app.eval.db import ensure_eval_database
 from app.eval.schema import EVAL_SCHEMA_SQL
 from app.rag import store
-from app.rag.corpus import (
-    all_facts,
-    build_contamination_pairs,
-    build_corpus,
-    build_hallucination_questions,
-)
+from app.rag.corpus import build_benchmark, build_corpus
 from app.rag.ingest import embed_query_async, ingest_report
-from app.rag.retrieve import detect_anchor, fuse
-from app.rag.sufficiency import REFUSAL_REASONS, check_sufficiency
-from app.rag.verify import verify_answer
+from app.rag.retrieve import detect_anchor, fuse, keyword_weights, rrf_fuse
+from app.rag.sufficiency import check_sufficiency
+from app.rag.verify import _parse_numbers, _same_number, verify_answer
+
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 log = get_logger("eval")
 
-# 评测默认 mock 模式：CI/无 key 环境秒级跑完（模型下载只在真实标定发生）。
-# 必须在任何 get_settings() 调用之前设——settings 是 lru_cache 单件，
-# 早期版把这行放在 _reset_and_seed 里（init_store 之后），缓存已定值，
-# 设了也白设（死代码）；真实标定要显式 EMBEDDING_MODE=local。
-os.environ.setdefault("EMBEDDING_MODE", "mock")
-
-_HALLUCINATION_PREFIX = "预测"
-
-
-def _key_numbers(text: str) -> list[str]:
-    return re.findall(r"\d+(?:\.\d+)?", text)
+ANSWER_CATEGORIES = ("exact", "abbr", "calculation")
+ALL_CATEGORIES = (*ANSWER_CATEGORIES, "refusal")
+DEFAULT_STRATEGIES = ("vector_only", "keyword_only", "hybrid", "rrf")
+NUM_RE = re.compile(r"\d")
 
 
 async def init_eval_store() -> None:
@@ -68,300 +55,342 @@ async def init_eval_store() -> None:
         await conn.execute(EVAL_SCHEMA_SQL)
 
 
-async def _reset_and_seed(n_reports: int, seed: int):
-    """清空**评测库**并灌语料（FR-2 起 store 已指向独立评测库）。
-
-    这里保留 TRUNCATE 是安全的：连接池由 run_eval 用 `resolved_eval_dsn`
-    初始化，开发库不在这个进程的连接范围内。函数名保留是为了减少 diff。
-    """
-    pool = store.get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("TRUNCATE rag.documents CASCADE")
-    # distractors=True：灌入易混公司干扰报告——检索难度的来源（D13）
-    reports = build_corpus(n_reports=n_reports, seed=seed, distractors=True)
-    for r in reports:
-        await ingest_report(r)
-    return reports
-
-
-async def _search_strategy(
-    question: str,
-    strategy: str,
-    industry: str | None,
-    top_k: int,
-    anchor_on: bool = True,
-) -> list[dict]:
-    """按策略检索：vector_only / keyword_only / hybrid。
-
-    anchor_on=False 是消融位：关掉实体锚定跑同一题，量化锚定对
-    易混公司场景的增益（contamination 档的 before/after 就是这么来的）。
-    单路基线（vector_only/keyword_only）本就不带锚定——它们测的是
-    单路能力；锚定是 hybrid 策略的一部分。
-    """
-    qv = await embed_query_async(question)
-    v_rows = await store.vector_search(qv, top_k=top_k, industry=industry)
-    if strategy == "vector_only":
-        rows = v_rows
-    else:
-        # keyword_only/hybrid 共用系统同一份 IDF+指标词加权（keyword_weights）：
-        # 三策略对比只允许差"检索策略"，不允许差打分函数——早期版 keyword_only
-        # 不传 weights，把关键词路加权的增益错算进了 hybrid 的账。
-        from app.rag.retrieve import keyword_weights
-
-        weights = await keyword_weights(question)
-        k_rows = await store.keyword_search(
-            question, top_k=top_k, industry=industry, weights=weights
-        )
-        if strategy == "keyword_only":
-            rows = k_rows
-        else:
-            settings = get_settings()
-            vw = 0.0 if settings.embedding_mode == "mock" else settings.vector_weight
-            kw = 1.0 if settings.embedding_mode == "mock" else settings.keyword_weight
-            anchor = (
-                detect_anchor(question, await store.company_names()) if anchor_on else None
-            )
-            rows = fuse(v_rows, k_rows, vector_weight=vw, keyword_weight=kw, anchor=anchor)
-    return rows[:top_k]
-
-
-def _source_hit(rows: list[dict], source: str) -> bool:
-    """源文档命中：判据是"事实的源文档出现在 top-k"（与历史口径一致）。"""
-    return any(r["source"] == source for r in rows)
-
-
-def _evidence_chunk_hit(rows: list[dict], answer: str) -> bool:
-    """证据块命中（更严）：top-k 里要出现**含答案数字的块**，而不只是同文档。
-
-    源文档命中回答"找对公司了没有"，证据块命中回答"找对那段话了没有"——
-    后者才是生成阶段能引对证据的前提。两者都给，避免用一个口径掩盖
-    另一个口径的问题。
-    """
-    nums = _key_numbers(answer)
-    if not nums:
-        return False
-    return any(all(n in r["text"] for n in nums) for r in rows)
-
-
-async def run_eval(n_reports: int = 30, seed: int = 42, top_k: int = 5) -> dict:
-    """跑完整评测（分级），返回汇总指标（已落库）。
-
-    FR-2 起评测跑在**独立评测库**（`finrag_eval`）上：本进程 store 连接池
-    指向评测库，`TRUNCATE/灌数据` 不再碰开发库。per_fact 写真正的逐题明细
-    （问题/档位/命中/top-k 来源/答案/拒答原因），可下钻到每一条 miss。
-    """
+async def seed_eval_corpus(
+    n_companies: int, years: tuple[int, ...], seed: int
+) -> tuple[list, str]:
+    """在独立评测库灌语料，返回 (reports, eval_db)。"""
     settings = get_settings()
     eval_dsn = settings.resolved_eval_dsn
     eval_db = await ensure_eval_database(settings.pg_dsn, eval_dsn)
     await store.close_store()
     await store.init_store(dsn=eval_dsn)
     await init_eval_store()
-    reports = await _reset_and_seed(n_reports, seed)
-    facts = all_facts(reports)
+    pool = store.get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE rag.documents CASCADE")
+    await store.reset_lexical_index()
+    reports = build_corpus(n_companies=n_companies, years=years, seed=seed)
+    for report in reports:
+        await ingest_report(report)
+    return reports, eval_db
 
-    strategies = ("vector_only", "keyword_only", "hybrid")
-    # 每策略每档的命中计数：[exact, paraphrase]
-    hit_counts = {st: [0, 0] for st in strategies}
-    # 证据块命中（更严口径，只对词路与混合路有意义）
-    evidence_hits = {"keyword_only": [0, 0], "hybrid": [0, 0]}
-    answer_ok = [0, 0]  # [exact, paraphrase]
-    faithfulness_claims = [0, 0]  # [supported, total]
+
+def answer_matches(expected: str | None, got: str) -> bool:
+    """答案判定：有数字按边界/单位比较；无数字（如公司名）按包含匹配。"""
+    if not expected:
+        return False
+    expected_numbers = _parse_numbers(expected)
+    if expected_numbers:
+        got_numbers = _parse_numbers(got)
+        return all(
+            any(_same_number(value, kind, gv, gk) for _gr, gv, gk in got_numbers)
+            for _raw, value, kind in expected_numbers
+        )
+    return expected.strip() in got
+
+
+def evidence_hit(rows: list[dict], terms: list[str]) -> bool:
+    """证据命中：top-k 里存在一块包含**证据值词**（带数字的词）。
+
+    公司简称/指标词通常分散在不同块（财务段没有公司名），把全部词都要求
+    在一块里会让所有题都 miss；检索质量用 source 命中判，证据命中只验证
+    "答案数字有没有出现在被检索到的块里"。
+    """
+    if not rows or not terms:
+        return False
+    value_terms = [t for t in terms if NUM_RE.search(t)] or terms
+    return any(all(term in row["text"] for term in value_terms) for row in rows)
+
+
+def source_rank(rows: list[dict], source: str | None) -> int | None:
+    if not source:
+        return None
+    for i, row in enumerate(rows, 1):
+        if row["source"] == source:
+            return i
+    return None
+
+
+async def candidate_rows(question: str, top_k: int) -> tuple[list[dict], list[dict], str | None]:
+    qv = await embed_query_async(question)
+    vector_rows = await store.vector_search(qv, top_k=top_k)
+    weights = await keyword_weights(question)
+    keyword_rows = await store.keyword_search(
+        question, top_k=max(4, top_k), weights=weights
+    )
+    anchor = detect_anchor(question, await store.company_names())
+    return vector_rows, keyword_rows, anchor
+
+
+def rank_with_strategy(
+    question: str,
+    strategy: str,
+    vector_rows: list[dict],
+    keyword_rows: list[dict],
+    anchor: str | None,
+    top_k: int,
+) -> list[dict]:
+    settings = get_settings()
+    if strategy == "vector_only":
+        return vector_rows[:top_k]
+    if strategy == "keyword_only":
+        return keyword_rows[:top_k]
+    # mock 模式向量是哈希噪声：融合权重归零走纯关键词（与生产 hybrid_search 一致）
+    vw = 0.0 if settings.embedding_mode == "mock" else settings.vector_weight
+    kw = 1.0 if settings.embedding_mode == "mock" else settings.keyword_weight
+    if strategy == "hybrid":
+        return fuse(vector_rows, keyword_rows, vector_weight=vw, keyword_weight=kw,
+                    anchor=anchor)[:top_k]
+    rrf = rrf_fuse(vector_rows, keyword_rows, vector_weight=vw, keyword_weight=kw,
+                   anchor=anchor)
+    if strategy == "rrf_rerank":
+        from app.rag.rerank import rerank
+
+        return rerank(question, rrf, top_n=top_k)
+    return rrf[:top_k]
+
+
+async def _ask(question: str, session_id: str, timeout_s: float) -> dict:
+    from app.rag.graph import ask
+
+    try:
+        async with asyncio.timeout(timeout_s):
+            return await ask(question, session_id=session_id)
+    except TimeoutError:
+        return {"status": "failed", "error": f"单题超时（>{int(timeout_s)}s）"}
+    except Exception as e:  # noqa: BLE001 - runner 不因单题崩溃
+        return {"status": "failed", "error": str(e)[:200]}
+
+
+def _rate(num: int, den: int) -> float:
+    return round(num / den, 4) if den else 0.0
+
+
+async def _oracle_chunks(source: str | None, cache: dict[str, list[dict]]) -> list[dict]:
+    """期望源的全文块（守卫误拒率的判据）。
+
+    守卫误拒率要回答的是"证据充分时会不会被误拒"，不是"检索没捞到时会不会
+    拒答"——后者是检索指标。用 gold source 的全部块做 oracle，才能把守卫
+    本身的严格度与检索质量解耦。
+    """
+    if not source:
+        return []
+    if source in cache:
+        return cache[source]
+    pool = store.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT source, section_path, chunk_index, kind, text"
+            " FROM rag.chunks WHERE source = $1 ORDER BY chunk_index",
+            source,
+        )
+    cache[source] = [dict(r) for r in rows]
+    return cache[source]
+
+
+async def run_eval(
+    n_companies: int = 200,
+    years: tuple[int, ...] = (2021, 2022, 2023, 2024, 2025),
+    seed: int = 42,
+    strategies: tuple[str, ...] = DEFAULT_STRATEGIES,
+    n_exact: int = 300,
+    n_abbr: int = 300,
+    n_calc: int = 100,
+    n_refusal: int = 100,
+    limit: int = 0,
+    end2end_limit: int = 0,
+    timeout_s: float = 120.0,
+) -> dict:
+    settings = get_settings()
+    t_seed = time.perf_counter()
+    reports, eval_db = await seed_eval_corpus(n_companies, years, seed)
+    seed_s = time.perf_counter() - t_seed
+    n_chunks, _avg_len = await store.corpus_stats()
+    benchmark = build_benchmark(
+        reports, seed=seed,
+        n_exact=n_exact, n_abbr=n_abbr, n_calc=n_calc, n_refusal=n_refusal,
+    )
+    if limit:
+        benchmark = benchmark[:limit]
+
+    # 端到端抽样：按题档分层取，避免"只抽到 exact"造成分档指标失真
+    end2end_selected: set[int] | None = None
+    if end2end_limit > 0:
+        pools: dict[str, list[int]] = defaultdict(list)
+        for i, item in enumerate(benchmark):
+            if item.category in ANSWER_CATEGORIES:
+                pools[item.category].append(i)
+        per_cat = max(1, end2end_limit // len(ANSWER_CATEGORIES))
+        end2end_selected = set()
+        # 先打散：题库按子类顺序排列（yoy→yoy_diff→share→industry_max），
+        # 直接取前 N 会只抽到 yoy，200 题样本看起来虚高（FR-9 实测踩坑）
+        import random as _random
+
+        pick_rng = _random.Random(f"end2end:{seed}")
+        for cat, idxs in pools.items():
+            shuffled = list(idxs)
+            pick_rng.shuffle(shuffled)
+            end2end_selected.update(shuffled[:per_cat])
+
+    # 计数容器：retrieval[strategy][category] = {n, source_hits, evidence_hits, mrr}
+    retrieval: dict[str, dict[str, dict[str, float]]] = {
+        st: {cat: {"n": 0, "source": 0, "evidence": 0, "mrr": 0.0} for cat in ALL_CATEGORIES}
+        for st in strategies
+    }
+    answer: dict[str, dict[str, int]] = {
+        cat: {"n": 0, "ok": 0} for cat in ANSWER_CATEGORIES
+    }
+    refusal: dict[str, dict[str, int]] = defaultdict(lambda: {"n": 0, "ok": 0})
+    guard: dict[str, dict[str, int]] = {
+        cat: {"n": 0, "refused": 0} for cat in ANSWER_CATEGORIES
+    }
+    faith = {"supported": 0, "total": 0}
+    oracle_cache: dict[str, list[dict]] = {}
     latencies: list[float] = []
-    tier_sizes = [len(facts), sum(len(f.variants) for f in facts)]
-    # 守卫误拒：可回答问题被 check_sufficiency 拒掉的计数（按档）
-    guard_false_reject = [0, 0]
-    per_fact: list[dict] = []
+    records: list[dict] = []
+    end2end_used = 0
 
-    for fact in facts:
-        # 评测计划：tier 0 = 原题（端到端问答也跑这档）；tier 1 = 同义改写题
-        plan: list[tuple[int, str]] = [(0, fact.question)]
-        plan.extend((1, v) for v in fact.variants)
-        for tier, q in plan:
-            rows_by_strategy: dict[str, list[dict]] = {}
+    for idx, q in enumerate(benchmark, 1):
+        record: dict[str, Any] = {
+            "qid": q.qid,
+            "category": q.category,
+            "subtype": q.subtype,
+            "question": q.question,
+            "source": q.source,
+            "expected_answer": q.answer,
+            "expected": q.expected,
+            "retrieval": {},
+        }
+        if q.category in ANSWER_CATEGORIES:
+            v, k, anchor = await candidate_rows(q.question, top_k=5)
             for st in strategies:
-                rows = await _search_strategy(q, st, None, top_k)
-                rows_by_strategy[st] = rows
-                if _source_hit(rows, fact.source):
-                    hit_counts[st][tier] += 1
-            # 证据块命中（更严口径）复用同一批检索结果——不重复搜两遍
-            for st in ("keyword_only", "hybrid"):
-                if _evidence_chunk_hit(rows_by_strategy[st], fact.answer):
-                    evidence_hits[st][tier] += 1
-            # 守卫误拒（FR-2）：拿同一份 hybrid 证据过确定性守卫，统计可回答
-            # 问题被误拒的比例——"证据换说法被拒"是 paraphrase 档最隐蔽的失败
-            guard_reason = check_sufficiency(q, rows_by_strategy["hybrid"])
-            if guard_reason:
-                guard_false_reject[tier] += 1
-            item: dict = {
-                "kind": "fact",
-                "fact_id": fact.fact_id,
-                "source": fact.source,
-                "tier": "exact" if tier == 0 else "paraphrase",
-                "question": q,
-                "retrieval_hit": {
-                    st: _source_hit(rows_by_strategy[st], fact.source) for st in strategies
-                },
-                "evidence_hit": {
-                    st: _evidence_chunk_hit(rows_by_strategy[st], fact.answer)
-                    for st in ("keyword_only", "hybrid")
-                },
-                "top_sources": {
-                    st: [r["source"] for r in rows_by_strategy[st][:top_k]]
-                    for st in strategies
-                },
-                "guard_refusal_reason": guard_reason,
-            }
-            # 端到端问答只跑原题（改写题走检索对比即可，LLM 成本留给原题）
-            if tier == 0:
-                from app.rag.graph import ask
+                rows = rank_with_strategy(q.question, st, v, k, anchor, 5)
+                rank = source_rank(rows, q.source)
+                hit = rank is not None
+                ev = evidence_hit(rows, q.evidence_terms)
+                cell = retrieval[st][q.category]
+                cell["n"] += 1
+                cell["source"] += int(hit)
+                cell["evidence"] += int(ev)
+                cell["mrr"] += (1.0 / rank) if rank else 0.0
+                record["retrieval"][st] = {
+                    "rank": rank, "source_hit": hit, "evidence_hit": ev,
+                    "top_sources": [r["source"] for r in rows[:5]],
+                }
+            reason = check_sufficiency(q.question, await _oracle_chunks(q.source, oracle_cache))
+            guard[q.category]["n"] += 1
+            guard[q.category]["refused"] += int(bool(reason))
+            record["guard_refusal_reason"] = reason
 
-                started = time.perf_counter()
-                final = await ask(q, session_id=f"eval-{fact.fact_id}")
-                latency_ms = (time.perf_counter() - started) * 1000
-                latencies.append(latency_ms)
-
-                want = _key_numbers(fact.answer)
+            run_end2end = (
+                end2end_limit == 0
+                or (end2end_limit > 0 and end2end_selected is not None and idx - 1 in end2end_selected)
+            )
+            if run_end2end:
+                end2end_used += 1
+                t0 = time.perf_counter()
+                final = await _ask(q.question, q.qid, timeout_s)
+                latency = (time.perf_counter() - t0) * 1000
+                latencies.append(latency)
                 got = final.get("answer", "")
-                ans_ok = any(w in got for w in want) and final.get("status") == "done"
-                answer_ok[0] += int(ans_ok)
-
+                ok = final.get("status") == "done" and answer_matches(q.answer, got)
+                answer[q.category]["n"] += 1
+                answer[q.category]["ok"] += int(ok)
                 _passed, _ratio, verdicts = verify_answer(
-                    final.get("answer", ""), final.get("retrieved") or []
+                    got, final.get("retrieved") or []
                 )
-                faithfulness_claims[0] += sum(1 for v in verdicts if v.supported)
-                faithfulness_claims[1] += len(verdicts)
-                item.update({
+                faith["supported"] += sum(1 for v in verdicts if v.supported)
+                faith["total"] += len(verdicts)
+                record.update({
                     "answer": got,
                     "status": final.get("status"),
-                    "answer_ok": ans_ok,
+                    "answer_ok": ok,
                     "refusal_reason": final.get("refusal_reason"),
                     "verdicts": [
                         {"claim": v.claim, "supported": v.supported} for v in verdicts
                     ],
-                    "latency_ms": round(latency_ms, 1),
+                    "latency_ms": round(latency, 1),
                 })
-            per_fact.append(item)
+            else:
+                record.update({"answer": None, "status": "skipped", "answer_ok": None})
+        else:
+            t0 = time.perf_counter()
+            final = await _ask(q.question, q.qid, timeout_s)
+            latency = (time.perf_counter() - t0) * 1000
+            latencies.append(latency)
+            ok = final.get("status") == "insufficient"
+            refusal[q.subtype]["n"] += 1
+            refusal[q.subtype]["ok"] += int(ok)
+            record.update({
+                "answer": final.get("answer", ""),
+                "status": final.get("status"),
+                "refusal_reason": final.get("refusal_reason"),
+                "refused": ok,
+                "latency_ms": round(latency, 1),
+            })
+        records.append(record)
+        if idx % 50 == 0:
+            print(f"  ... {idx}/{len(benchmark)}", flush=True)
 
-    # ---- 拒答档：三类无答案题（D13）----
-    hallucination_qs = build_hallucination_questions(reports)
-    refuse_by_type: dict[str, list[int]] = {}
-    refusal_miss: list[int] = [0, 0]  # [漏拒, 总数]
-    for hq in hallucination_qs:
-        from app.rag.graph import ask
+    retrieval_metrics: dict[str, dict[str, dict[str, float]]] = {}
+    for st in strategies:
+        retrieval_metrics[st] = {}
+        for cat in ALL_CATEGORIES:
+            cell = retrieval[st][cat]
+            n = int(cell["n"])
+            retrieval_metrics[st][cat] = {
+                "n": n,
+                "recall@5": _rate(int(cell["source"]), n),
+                "evidence_hit": _rate(int(cell["evidence"]), n),
+                "mrr": round(cell["mrr"] / n, 4) if n else 0.0,
+            }
 
-        final = await ask(hq.question, session_id=f"eval-hallu-{hq.htype}")
-        ok = final.get("status") == "insufficient"
-        reason = final.get("refusal_reason", "")
-        bucket = refuse_by_type.setdefault(hq.htype, [0, 0])
-        bucket[0] += int(ok)
-        bucket[1] += 1
-        refusal_miss[0] += int(not ok)
-        refusal_miss[1] += 1
-        # 判据交叉验证：拒答必须归因于充分性守卫或引用校验，
-        # 不允许"检索碰巧为空"这种不可解释的拒答蒙混过关
-        assert ok is False or reason in {*REFUSAL_REASONS, "retrieval_empty"} or final.get(
-            "verdicts"
-        ), f"拒答 {hq.question} 归因不可解释: {reason}"
-        per_fact.append({
-            "kind": "refusal",
-            "htype": hq.htype,
-            "question": hq.question,
-            "company": hq.company,
-            "status": final.get("status"),
-            "refusal_reason": reason,
-            "passed": ok,
-            "answer": final.get("answer", ""),
-        })
+    answerable_n = sum(v["n"] for v in answer.values())
+    answerable_ok = sum(v["ok"] for v in answer.values())
+    refusal_n = sum(v["n"] for v in refusal.values())
+    refusal_ok = sum(v["ok"] for v in refusal.values())
+    total_eval = answerable_n + refusal_n
+    overall = (
+        _rate(answerable_ok + refusal_ok, total_eval)
+        if answerable_n > 0 and refusal_n > 0 else None
+    )
 
-    # ---- 污染档：两个干净的指标，不混变量 ----
-    # 1) 检索消融（top1 源准确率，anchor off/on）：问 A 时检索首位必须是
-    # A 的文档——量化实体锚定对易混公司场景的增益，只动检索不动生成
-    # 2) 答案级污染：问 A 的答案必须含 A 的数字、且不含 B 的数字——
-    # 测系统端到端行为（走默认管线，锚定开）
-    pairs = build_contamination_pairs(reports)
-    top1 = {"anchor_off": [0, 0], "anchor_on": [0, 0]}
-    contamination = [0, 0]
-    for pair in pairs:
-        top1_hits: dict[str, bool] = {}
-        for mode, anchor_on in (("anchor_off", False), ("anchor_on", True)):
-            rows = await _search_strategy(
-                pair.question, "hybrid", None, top_k, anchor_on=anchor_on
-            )
-            hit = bool(rows) and rows[0]["source"].endswith("-" + pair.company)
-            top1_hits[mode] = hit
-            top1[mode][0] += int(hit)
-            top1[mode][1] += 1
-        from app.rag.graph import ask
-
-        final = await ask(pair.question, session_id=f"eval-contam-{pair.company}")
-        got = final.get("answer", "")
-        b_num = _key_numbers(pair.b_answer)
-        a_num = _key_numbers(pair.a_answer)
-        leaked = any(n in got for n in b_num)
-        has_a = any(n in got for n in a_num)
-        contamination[0] += int(has_a and not leaked)
-        contamination[1] += 1
-        per_fact.append({
-            "kind": "contamination",
-            "question": pair.question,
-            "company": pair.company,
-            "distractor_company": pair.distractor_company,
-            "top1": top1_hits,
-            "has_own_number": has_a,
-            "leaked_distractor": leaked,
-            "passed": bool(has_a and not leaked),
-            "answer": got,
-        })
-
-    def _rate(num: int, den: int) -> float:
-        return round(num / den, 4) if den else 0.0
+    guard_false_reject = {
+        cat: _rate(guard[cat]["refused"], guard[cat]["n"]) for cat in ANSWER_CATEGORIES
+    }
+    refusal_accuracy = {
+        subtype: _rate(v["ok"], v["n"]) for subtype, v in sorted(refusal.items())
+    }
+    refusal_miss = 1.0 - (refusal_ok / refusal_n) if refusal_n else 0.0
 
     latencies.sort()
-    metrics = {
-        "mode": settings.embedding_mode,
-        "corpus_seed": seed,
-        "n_reports": n_reports,
-        "n_docs": len(reports),
-        "n_facts": len(facts),
-        "top_k": top_k,
+    metrics: dict[str, Any] = {
         "eval_database": eval_db,
-        # 检索命中：exact 档是管线自检（实体逐字出现，接近 100% 是结构属性），
-        # paraphrase 档才是语义检索的质量声明——README 与简历只引用后者
-        "retrieval_hit": {
-            st: {
-                "exact": _rate(hit_counts[st][0], tier_sizes[0]),
-                "paraphrase": _rate(hit_counts[st][1], tier_sizes[1]),
-            }
-            for st in strategies
+        "mode": settings.embedding_mode,
+        "llm_mode": settings.llm_mode,
+        "corpus_seed": seed,
+        "n_companies": n_companies,
+        "years": list(years),
+        "n_reports": len(reports),
+        "n_chunks": n_chunks,
+        "n_questions": len(benchmark),
+        "end2end_sample": end2end_used,
+        "seed_time_s": round(seed_s, 1),
+        "retrieval": retrieval_metrics,
+        "answer_accuracy": {
+            cat: (_rate(v["ok"], v["n"]) if v["n"] else None)
+            for cat, v in answer.items()
         },
-        "evidence_chunk_hit": {
-            st: {
-                "exact": _rate(evidence_hits[st][0], tier_sizes[0]),
-                "paraphrase": _rate(evidence_hits[st][1], tier_sizes[1]),
-            }
-            for st in evidence_hits
-        },
-        "answer_accuracy": _rate(answer_ok[0], tier_sizes[0]),
-        "citation_faithfulness": _rate(faithfulness_claims[0], faithfulness_claims[1]),
-        "refusal_accuracy": {
-            htype: _rate(v[0], v[1]) for htype, v in sorted(refuse_by_type.items())
-        },
-        # FR-2：误拒（可回答问题被守卫拒）与漏拒（无答案题没拒）分开报告
-        "guard_false_reject": {
-            "exact": _rate(guard_false_reject[0], tier_sizes[0]),
-            "paraphrase": _rate(guard_false_reject[1], tier_sizes[1]),
-        },
-        "refusal_miss_rate": _rate(refusal_miss[0], refusal_miss[1]),
-        # 污染档两个指标：top1 是检索消融（只动检索），contamination 是答案级
-        # 系统行为（走默认管线）——分开报告，不把两个变量混成一个数
-        "top1_source_accuracy": {
-            mode: _rate(v[0], v[1]) for mode, v in top1.items()
-        },
-        "contamination": _rate(contamination[0], contamination[1]),
+        "answer_accuracy_overall": _rate(answerable_ok, answerable_n),
+        "refusal_accuracy": refusal_accuracy,
+        "refusal_miss_rate": round(refusal_miss, 4),
+        "overall_accuracy": overall,
+        "guard_false_reject": guard_false_reject,
+        "citation_faithfulness": _rate(faith["supported"], faith["total"]),
         "latency_ms": {
-            "p50": round(latencies[len(latencies) // 2], 1),
-            "p95": round(latencies[int(len(latencies) * 0.95)], 1),
-            "max": round(latencies[-1], 1),
+            "p50": round(statistics.median(latencies), 1) if latencies else 0.0,
+            "p95": round(latencies[min(int(len(latencies) * 0.95), len(latencies) - 1)], 1)
+            if latencies else 0.0,
         },
         "evaluated_at": datetime.now(UTC).isoformat(),
     }
@@ -371,63 +400,137 @@ async def run_eval(n_reports: int = 30, seed: int = 42, top_k: int = 5) -> dict:
         await conn.execute(
             "INSERT INTO eval.runs (mode, corpus_seed, n_facts, metrics, per_fact)"
             " VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)",
-            settings.embedding_mode, seed, len(facts),
+            settings.embedding_mode, seed, sum(len(r.facts) for r in reports),
             json.dumps(metrics, ensure_ascii=False),
-            json.dumps(
-                {"tier_sizes": tier_sizes, "items": per_fact}, ensure_ascii=False
-            ),
+            json.dumps({"n_reports": len(reports), "items": records}, ensure_ascii=False),
         )
-
     await store.close_store()
-    log.info("eval.done", extra={"context": metrics})
+    log.info("eval.done", extra={"context": {"overall": overall, "n": len(benchmark)}})
     return metrics
 
 
-def _fmt_row(name: str, vals: list[float]) -> str:
-    body = "  ".join(f"{v * 100:6.1f}%" for v in vals)
-    mean = sum(vals) / len(vals) if vals else 0.0
-    spread = (max(vals) - min(vals)) if len(vals) > 1 else 0.0
-    return f"{name:<28} {body}   均值 {mean * 100:5.1f}%  极差 {spread * 100:4.1f}%"
+# ---------------------------------------------------------------- 报告输出
+
+
+def _collect(runs: list[dict], path: tuple[str, ...]) -> list[float]:
+    vals: list[float] = []
+    for run in runs:
+        cur: Any = run
+        for key in path:
+            if not isinstance(cur, dict) or key not in cur:
+                cur = None
+                break
+            cur = cur[key]
+        if isinstance(cur, (int, float)):
+            vals.append(float(cur))
+    return vals
+
+
+def _fmt_row(label: str, vals: list[float], seeds: list[int]) -> str:
+    if not vals:
+        return f"{label:<34} " + "  ".join("-" for _ in seeds)
+    mean = sum(vals) / len(vals)
+    spread = max(vals) - min(vals)
+    cells = "  ".join(f"{v:>6.1%}" for v in vals)
+    if len(vals) == 1:
+        return f"{label:<34} {cells}"
+    return f"{label:<34} {cells}  均值 {mean:>6.1%}  极差 {spread:>5.1%}"
+
+
+def _fmt_raw(label: str, vals: list[float], seeds: list[int], unit: str = "") -> str:
+    if not vals:
+        return f"{label:<34} " + "  ".join("-" for _ in seeds)
+    cells = "  ".join(f"{v:>7.3f}{unit}" for v in vals)
+    if len(vals) == 1:
+        return f"{label:<34} {cells}"
+    mean = sum(vals) / len(vals)
+    return f"{label:<34} {cells}  均值 {mean:.3f}{unit}"
+
+
+def _mrr_all(run: dict, strategy: str) -> float:
+    total = 0
+    acc = 0.0
+    for cat in ANSWER_CATEGORIES:
+        cell = run["retrieval"][strategy][cat]
+        total += cell["n"]
+        acc += cell["mrr"] * cell["n"]
+    return acc / total if total else 0.0
 
 
 def main() -> None:
-    reports_n = int(os.environ.get("FINRAG_EVAL_REPORTS", "30"))
-    seeds = [int(s) for s in os.environ.get("FINRAG_EVAL_SEEDS", "42").split(",") if s.strip()]
-    runs = [asyncio.run(run_eval(n_reports=reports_n, seed=seed)) for seed in seeds]
+    parser = argparse.ArgumentParser(description="FinRAG 难基准评测")
+    parser.add_argument("--companies", type=int, default=200)
+    parser.add_argument("--years", default="2021,2022,2023,2024,2025")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seeds", default="", help="多种子逗号分隔（覆盖 --seed）")
+    parser.add_argument("--strategies", default=",".join(DEFAULT_STRATEGIES))
+    parser.add_argument("--exact", type=int, default=300)
+    parser.add_argument("--abbr", type=int, default=300)
+    parser.add_argument("--calc", type=int, default=100)
+    parser.add_argument("--refusal", type=int, default=100)
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--end2end", type=int, default=0,
+                        help="端到端最多跑多少道可答题（0=全跑）")
+    parser.add_argument("--timeout", type=float, default=120.0)
+    args = parser.parse_args()
 
-    # 多种子汇总：单种子 100% 可能是运气，均值+极差才是诚实表述
-    def collect(path):
-        out = []
-        for r in runs:
-            cur = r
-            for p in path:
-                cur = cur[p]
-            out.append(float(cur))
-        return out
+    years = tuple(int(y) for y in args.years.split(",") if y.strip())
+    seeds = (
+        [int(s) for s in args.seeds.split(",") if s.strip()]
+        if args.seeds.strip()
+        else [args.seed]
+    )
+    strategies = tuple(s.strip() for s in args.strategies.split(",") if s.strip())
+    defaults = {"n_companies": args.companies, "years": years, "strategies": strategies,
+                "n_exact": args.exact, "n_abbr": args.abbr, "n_calc": args.calc,
+                "n_refusal": args.refusal, "limit": args.limit,
+                "end2end_limit": args.end2end, "timeout_s": args.timeout}
 
-    print(f"\n===== FinRAG 评测汇总（{len(seeds)} 个种子: {seeds}）=====")
-    print(f"模式: {runs[0]['mode']}  文档: {runs[0]['n_docs']}  事实: {runs[0]['n_facts']}")
-    print(f"{'指标':<28} " + "  ".join(f"seed={s:<5}" for s in seeds))
+    runs: list[dict] = []
+    for seed in seeds:
+        print(f"\n===== seed={seed} =====", flush=True)
+        metrics = asyncio.run(run_eval(seed=seed, **defaults))
+        runs.append(metrics)
+        print(
+            f"  文档 {metrics['n_reports']} / 块 {metrics['n_chunks']} / "
+            f"题 {metrics['n_questions']} / 建库 {metrics['seed_time_s']}s"
+        )
+
+    print(f"\n===== FinRAG 难基准评测（{len(seeds)} 个种子: {seeds}）=====")
+    print(f"模式: {runs[0]['mode']}  公司: {runs[0]['n_companies']} × "
+          f"年份 {runs[0]['years']}  文档 {runs[0]['n_reports']}  块 {runs[0]['n_chunks']}")
+    print(f"{'指标':<34} " + "  ".join(f"seed={s:<5}" for s in seeds))
     print("-" * 78)
-    for st in ("vector_only", "keyword_only", "hybrid"):
-        print(_fmt_row(f"recall@5 {st} (exact)", collect(["retrieval_hit", st, "exact"])))
-        print(_fmt_row(f"recall@5 {st} (paraphrase)", collect(["retrieval_hit", st, "paraphrase"])))
-    for st in ("keyword_only", "hybrid"):
-        print(_fmt_row(f"证据块命中 {st} (exact)", collect(["evidence_chunk_hit", st, "exact"])))
-        print(_fmt_row(f"证据块命中 {st} (paraphrase)", collect(["evidence_chunk_hit", st, "paraphrase"])))
-    print(_fmt_row("answer_accuracy", collect(["answer_accuracy"])))
-    print(_fmt_row("citation_faithfulness", collect(["citation_faithfulness"])))
-    print(_fmt_row("守卫误拒 (exact)", collect(["guard_false_reject", "exact"])))
-    print(_fmt_row("守卫误拒 (paraphrase)", collect(["guard_false_reject", "paraphrase"])))
-    print(_fmt_row("拒答漏拒率", collect(["refusal_miss_rate"])))
-    for htype in runs[0]["refusal_accuracy"]:
-        print(_fmt_row(f"拒答率 {htype}", collect(["refusal_accuracy", htype])))
-    print(_fmt_row("检索 top1 源准确率 (anchor off)", collect(["top1_source_accuracy", "anchor_off"])))
-    print(_fmt_row("检索 top1 源准确率 (anchor on)", collect(["top1_source_accuracy", "anchor_on"])))
-    print(_fmt_row("答案级污染拦截", collect(["contamination"])))
+    for st in strategies:
+        for cat in ANSWER_CATEGORIES:
+            print(_fmt_row(f"recall@5 {st} ({cat})",
+                           _collect(runs, ("retrieval", st, cat, "recall@5")), seeds))
+        print(_fmt_raw(f"mrr {st} (all answerable)",
+                       [_mrr_all(r, st) for r in runs], seeds))
+    for cat in ANSWER_CATEGORIES:
+        print(_fmt_row(f"answer_accuracy ({cat})",
+                       _collect(runs, ("answer_accuracy", cat)), seeds))
+    print(_fmt_row("answer_accuracy (overall)",
+                   _collect(runs, ("answer_accuracy_overall",)), seeds))
+    for subtype in runs[0]["refusal_accuracy"]:
+        print(_fmt_row(f"refusal_accuracy ({subtype})",
+                       _collect(runs, ("refusal_accuracy", subtype)), seeds))
+    print(_fmt_row("refusal_miss_rate", _collect(runs, ("refusal_miss_rate",)), seeds))
+    print(_fmt_row("guard_false_reject (exact)",
+                   _collect(runs, ("guard_false_reject", "exact")), seeds))
+    print(_fmt_row("guard_false_reject (abbr)",
+                   _collect(runs, ("guard_false_reject", "abbr")), seeds))
+    print(_fmt_row("guard_false_reject (calculation)",
+                   _collect(runs, ("guard_false_reject", "calculation")), seeds))
+    print(_fmt_row("citation_faithfulness",
+                   _collect(runs, ("citation_faithfulness",)), seeds))
+    print(_fmt_row("overall_accuracy", _collect(runs, ("overall_accuracy",)), seeds))
+    print(_fmt_raw("P95 延迟", _collect(runs, ("latency_ms", "p95")), seeds, "ms"))
     print("-" * 78)
-    print(json.dumps(runs[0], ensure_ascii=False, indent=2))
+    for run in runs:
+        print(json.dumps(run, ensure_ascii=False, indent=2)[:1200])
 
 
 if __name__ == "__main__":
+    ensure_selector_loop()
     main()
