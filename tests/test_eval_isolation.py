@@ -9,7 +9,6 @@ import json
 from urllib.parse import urlsplit
 
 import asyncpg
-import pytest
 
 from app.core.config import get_settings
 from app.eval.db import ensure_eval_database
@@ -130,11 +129,11 @@ async def test_per_fact_逐题明细落库可下钻(monkeypatch):
 
 async def test_评测库残留不污染下一次(monkeypatch):
     """同一评测库连续跑两次：第二次必须从头重建（块数不翻倍）。"""
-    args = dict(
-        n_companies=2, years=(2025,), seed=42,
-        n_exact=6, n_abbr=6, n_calc=4, n_refusal=4,
-        strategies=("keyword_only",), end2end_limit=-1,
-    )
+    args = {
+        "n_companies": 2, "years": (2025,), "seed": 42,
+        "n_exact": 6, "n_abbr": 6, "n_calc": 4, "n_refusal": 4,
+        "strategies": ("keyword_only",), "end2end_limit": -1,
+    }
     first = await run_eval(**args)
     second = await run_eval(**args)
     assert second["n_chunks"] == first["n_chunks"], "重建后块数翻倍=旧块没清干净"

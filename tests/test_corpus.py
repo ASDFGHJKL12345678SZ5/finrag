@@ -10,7 +10,6 @@ import re
 import pytest
 
 from app.rag.corpus import (
-    _SEGMENTS,
     UNSUPPORTED_METRICS,
     WRONG_YEARS,
     all_facts,
@@ -50,7 +49,7 @@ def test_语料确定性():
 def test_公司池200家_40组易混_简称与缩写唯一():
     companies = build_companies()
     assert len(companies) == 200
-    assert len({c.group for c in companies}) == 40 >= 30
+    assert len({c.group for c in companies}) == 40  # 计划要求 ≥30 组
     assert len({c.short for c in companies}) == 200
     assert len({c.abbr for c in companies}) == 200
     for c in companies:

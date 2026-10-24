@@ -27,6 +27,13 @@ jobs:
           --health-cmd pg_isready --health-interval 10s
           --health-timeout 5s --health-retries 5
 
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 10s
+          --health-timeout 5s --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -54,6 +61,9 @@ jobs:
           LLM_MODE: mock
           # CI 的 postgres 服务在 5432（本地开发容器是 5433）
           PG_DSN: postgresql://postgres:postgres@localhost:5432/finrag
+          # FR-8 限流器用 Redis Lua 脚本，CI 起 redis:7 服务后必须指向它；
+          # 不设的话 token_bucket 会 fail-open，限流测试就测了个寂寞
+          REDIS_URL: redis://localhost:6379/0
         run: python -m pytest tests/ -q
 
   frontend:

@@ -21,9 +21,8 @@ os.environ["LLM_MODE"] = "mock"
 from app.core.winloop import ensure_selector_loop
 from app.rag import store
 from app.rag.corpus import build_corpus
-from app.rag.graph import ask
+from app.rag.graph import ask, verify
 from app.rag.graph import route_after_verify as g_route
-from app.rag.graph import verify
 from app.rag.ingest import ingest_report
 
 ensure_selector_loop()
