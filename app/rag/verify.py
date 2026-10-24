@@ -9,23 +9,45 @@
 这里刻意用词面重合而不是语义相似——语义判断又需要一个模型，
 而词面校验对"编数字"这类最高危幻觉已经足够（模型编的数字几乎不可能
 恰好出现在语料里），且完全确定、可单测、零依赖。
+
+FR-7 收紧三处（都是真实误判/漏判形态）：
+1. **数字按边界匹配**：旧版子串匹配让 "5" 命中 "56.4"、"20" 命中 "2025"——
+   编造的 5 亿元只要证据里出现 56.4% 就能蒙混过关。现在要求数字前后
+   都不是数字/小数点。
+2. **单位归一后比较**：亿元/万元/元/百分比先换算再比数值——"0.5亿元" 与
+   "5000万元" 是同一个数，不能因为写法不同误杀。
+3. **一句话里的所有 [cN] 都参与核对**：旧版只取第一个引用，一句话引了
+   [c1][c2] 时 c2 的证据根本没被检查；现在把所有被引 chunk 拼起来核对，
+   任何一个引用编号不存在都判无据。
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 
-_NUM = re.compile(r"\d+(?:\.\d+)?%?")
+# 数字 + 可选单位。前后都排除数字/小数点：5 不能命中 56.4，20 不能命中 2025。
+_NUM = re.compile(
+    r"(?<![\d.])(\d+(?:\.\d+)?)(?:\s*(亿元|亿|万元|万|元|%))?(?![\d.])"
+)
 
 # 无引用论断的哨兵：刻意不用中文状态词——改写查询按词形过滤 missing
 # 列表，中文状态词会被当证据词拼回问题，污染下一轮检索
 NO_CITATION = "<no-citation>"
 
+# 金额单位换算到"元"；% 单独成类（不能和金额混）
+_UNIT_FACTOR = {
+    "亿": 1e8,
+    "亿元": 1e8,
+    "万": 1e4,
+    "万元": 1e4,
+    "元": 1.0,
+}
+
 
 @dataclass
 class ClaimVerdict:
     claim: str          # 论断原文（含数字的句子）
-    citation_id: str    # 论断引用的编号
+    citation_id: str    # 论断引用的编号（多引用用 + 连接，如 c1+c2）
     supported: bool     # 数字+关键词是否都在被引 chunk 里
     missing: list[str]  # 缺失的证据词
 
@@ -39,23 +61,27 @@ def split_claims(answer: str) -> list[tuple[str, str]]:
        必然误杀。先把句末的 [cN] 挪到句首，让引用跟着它修饰的句子走。
     2. 去列表序号："1. 宁德润能……" 里的 "1" 是序号不是数据，不剥掉
        会被当成数字论断，还常因无引用而误杀整篇答案。
+
+    一句话里可以有多个引用（"营收 X。[c1][c2]"）：按出现顺序去重后用
+    "+" 连接。
     """
-    # 句末引用 -> 句首（引用修饰的是它前面的句子）
+    # 句末引用 -> 句首（引用修饰的是它前面的句子）。
+    # 支持一句多个引用 [c1][c2]：整条引用链一起搬到句首，否则按句号切分后
+    # 后面的 [c2] 会掉到下一段、失去所属论断（FR-7 多引用 bug）。
     normalized = re.sub(
-        r"([。；;!?！？])\s*\[c(\d+)\]",
-        r"[c\2]\1",
+        r"([。；;!?！？])\s*((?:\[c\d+\]\s*)+)",
+        lambda m: m.group(2).strip() + m.group(1),
         answer,
     )
     claims: list[tuple[str, str]] = []
     for sentence in re.split(r"[。；;\n]", normalized):
         sentence = re.sub(
-            r"(^|[：:，,；;])\s*\d+[.、)）]\s*", r"\1",
-            sentence.strip(),
+            r"(^|[：:，,；;])\s*\d+[.、)）]\s*", r"\1", sentence.strip(),
         )
         # 先摘引用标记再查数字——[c1] 里的 1 不是数据，
         # 顺序反了会让每个带引用的句子都被当成数字论断
-        m = re.search(r"\[c(\d+)\]", sentence)
-        citation_id = f"c{m.group(1)}" if m else ""
+        citations = list(dict.fromkeys(re.findall(r"\[c(\d+)\]", sentence)))
+        citation_id = "+".join(f"c{n}" for n in citations)
         sentence = re.sub(r"\[c\d+\]\s*", "", sentence)
         if not sentence or not _NUM.search(sentence):
             continue
@@ -68,8 +94,8 @@ def verify_answer(
 ) -> tuple[bool, float, list[ClaimVerdict]]:
     """校验答案。返回 (是否通过, 支持率, 逐论断裁定)。
 
-    门禁策略是严格的：每个含数字的论断都必须带引用、且数字与实词都能
-    在被引 chunk 里找到——一个都不放过。金融场景"带病输出"比"拒答"
+    门禁策略是严格的：每个含数字的论断都必须带引用、且数字与实词都能在
+    被引 chunk 里找到——一个都不放过。金融场景"带病输出"比"拒答"
     危险得多，所以这里不做比例折中；min_citation_overlap 只作为报告
     指标（支持率）留在配置里，不参与门禁。
     没有数字论断的纯定性回答直接放行——校验只管数字幻觉。
@@ -77,11 +103,13 @@ def verify_answer(
     by_id = {c.get("citation_id"): c for c in chunks}
     verdicts: list[ClaimVerdict] = []
     for claim, citation_id in split_claims(answer):
-        chunk = by_id.get(citation_id)
-        if chunk is None:
+        cited_ids = citation_id.split("+") if citation_id else []
+        cited_chunks = [by_id.get(cid) for cid in cited_ids]
+        if not cited_ids or any(c is None for c in cited_chunks):
             verdicts.append(ClaimVerdict(claim, citation_id, False, [NO_CITATION]))
             continue
-        missing = _missing_evidence(claim, chunk["text"])
+        evidence = " ".join(c["text"] for c in cited_chunks if c is not None)
+        missing = _missing_evidence(claim, evidence)
         verdicts.append(ClaimVerdict(claim, citation_id, not missing, missing))
 
     if not verdicts:
@@ -92,21 +120,48 @@ def verify_answer(
     return passed, ratio, verdicts
 
 
+def _parse_numbers(text: str) -> list[tuple[str, float, str]]:
+    """[(原始写法, 归一后的数值, 类别)]，类别 = percent / money / bare。"""
+    out: list[tuple[str, float, str]] = []
+    for m in _NUM.finditer(text):
+        raw_number, unit = m.group(1), m.group(2)
+        value = float(raw_number)
+        if unit == "%":
+            out.append((m.group(0), value, "percent"))
+        elif unit in _UNIT_FACTOR:
+            out.append((m.group(0), value * _UNIT_FACTOR[unit], "money"))
+        else:
+            out.append((m.group(0), value, "bare"))
+    return out
+
+
+def _same_number(
+    value: float, kind: str, other_value: float, other_kind: str
+) -> bool:
+    # 百分比只和百分比比：5% 不能拿 5（元/亿元）顶替
+    if kind == "percent" or other_kind == "percent":
+        return kind == other_kind and abs(value - other_value) <= 1e-9
+    # 金额与裸数字可比：LLM 常把"378.43亿元"写成"378.43"（单位在句子里）
+    # 单位写法不同则先归一（0.5亿元 == 5000万元）
+    return abs(value - other_value) <= max(1e-9, abs(value) * 1e-9)
+
+
 def _missing_evidence(claim: str, evidence: str) -> list[str]:
     """论断里找不到依据的成分。
 
     两层检查，严格程度不同：
-    1. 数字（硬门禁）：论断里的每个数字都必须在被引证据里——模型编的
-       数字几乎不可能恰好出现在语料里，这一层拦最高危的幻觉。
+    1. 数字（硬门禁）：论断里的每个数字都必须在被引证据里按**边界 + 单位**
+       找到——模型编的数字几乎不可能恰好出现在语料里，这一层拦最高危的幻觉。
     2. 内容词（软门禁）：把论断切中文二元组，至少 2 个要能在证据里
        找到——防止"数字碰巧对上但话题完全不对"的张冠李戴。
        软门禁不要求全部命中：答案的引导语（"根据检索到的研报内容："）
        不是论断内容，逐词要求全中会把正常答案误杀（实测踩坑）。
     """
     missing: list[str] = []
-    for num in _NUM.findall(claim):
-        if num not in evidence:
-            missing.append(num)
+    evidence_numbers = _parse_numbers(evidence)
+    for raw, value, kind in _parse_numbers(claim):
+        if not any(_same_number(value, kind, ev, ek) for _, ev, ek in evidence_numbers):
+            missing.append(raw)
     bigrams = _content_bigrams(claim)
     hits = sum(1 for g in bigrams if g in evidence)
     if bigrams and hits < 2:

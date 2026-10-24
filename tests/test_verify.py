@@ -46,7 +46,7 @@ def test_编造的数字被拒():
     answer = "公司2025年实现营业收入999.99亿元，远超行业平均。[c1]"
     passed, _ratio, verdicts = verify_answer(answer, CHUNKS)
     assert passed is False
-    assert "999.99" in verdicts[0].missing
+    assert any("999.99" in m for m in verdicts[0].missing)
 
 
 def test_无引用的数字论断被拒():
@@ -62,7 +62,7 @@ def test_引用指向错误的chunk被拒():
     answer = "经营性现金流净额16.85亿元。[c1]"
     passed, _, verdicts = verify_answer(answer, CHUNKS)
     assert passed is False
-    assert "16.85" in verdicts[0].missing
+    assert any("16.85" in m for m in verdicts[0].missing)
 
 
 def test_纯定性回答放行():
@@ -70,3 +70,58 @@ def test_纯定性回答放行():
     passed, ratio, _ = verify_answer("该公司是新能源行业的代表性企业。[c1]", CHUNKS)
     assert passed is True
     assert ratio == 1.0
+
+
+# ---- FR-7：边界匹配 / 单位归一 / 多引用 ----
+
+
+def test_数字边界_5不命中56_4():
+    """旧版子串匹配让编造的 5 命中证据里的 56.4——必须拒。"""
+    answer = "公司营收增长 5%。[c1]"
+    passed, _ratio, verdicts = verify_answer(answer, CHUNKS)
+    assert passed is False
+    assert any("5%" in m for m in verdicts[0].missing)
+
+
+def test_数字边界_20不命中2025():
+    answer = "公司收入 20亿元。[c1]"
+    passed, _ratio, verdicts = verify_answer(answer, CHUNKS)
+    assert passed is False
+    assert any("20" in m for m in verdicts[0].missing)
+
+
+def test_单位归一_亿元与万元等价():
+    chunks = [_chunk("c1", "公司营业收入为5000万元。")]
+    answer = "公司营业收入为0.5亿元。[c1]"
+    passed, _ratio, verdicts = verify_answer(answer, chunks)
+    assert passed is True, verdicts
+
+
+def test_百分比不能拿金额顶替():
+    chunks = [_chunk("c1", "公司营业收入为5亿元。")]
+    answer = "公司毛利率为 5%。[c1]"
+    passed, _ratio, _verdicts = verify_answer(answer, chunks)
+    assert passed is False, "5% 与 5亿元 不是同一个数"
+
+
+def test_数值写法差异_5与5_0等价():
+    chunks = [_chunk("c1", "同比增长5.0%。")]
+    answer = "同比增长 5%。[c1]"
+    passed, _ratio, _verdicts = verify_answer(answer, chunks)
+    assert passed is True
+
+
+def test_多引用句_两个chunk都参与核对():
+    """一句话引了 [c1][c2]：两个 chunk 的证据合起来都要能支撑它。"""
+    answer = "公司营收378.43亿元，经营性现金流16.85亿元。[c1][c2]"
+    passed, _ratio, verdicts = verify_answer(answer, CHUNKS)
+    assert passed is True, verdicts
+    assert verdicts[0].citation_id == "c1+c2"
+
+    # c2 里没有 16.85 时，多引用也不能豁免
+    wrong = [_chunk("c1", "公司2025年实现营业收入378.43亿元。"),
+             _chunk("c2", "现金流状况良好。")]
+    passed2, _r2, verdicts2 = verify_answer(answer, wrong)
+    assert passed2 is False
+    assert any("16.85" in m for m in verdicts2[0].missing)
+

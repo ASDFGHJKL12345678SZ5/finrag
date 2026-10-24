@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.eval.db import ensure_eval_database
 from app.eval.schema import EVAL_SCHEMA_SQL
 from app.rag import store
 from app.rag.corpus import (
@@ -43,6 +44,7 @@ from app.rag.corpus import (
 )
 from app.rag.ingest import embed_query, ingest_report
 from app.rag.retrieve import detect_anchor, fuse
+from app.rag.sufficiency import REFUSAL_REASONS, check_sufficiency
 from app.rag.verify import verify_answer
 
 log = get_logger("eval")
@@ -67,6 +69,11 @@ async def init_eval_store() -> None:
 
 
 async def _reset_and_seed(n_reports: int, seed: int):
+    """清空**评测库**并灌语料（FR-2 起 store 已指向独立评测库）。
+
+    这里保留 TRUNCATE 是安全的：连接池由 run_eval 用 `resolved_eval_dsn`
+    初始化，开发库不在这个进程的连接范围内。函数名保留是为了减少 diff。
+    """
     pool = store.get_pool()
     async with pool.acquire() as conn:
         await conn.execute("TRUNCATE rag.documents CASCADE")
@@ -137,12 +144,20 @@ def _evidence_chunk_hit(rows: list[dict], answer: str) -> bool:
 
 
 async def run_eval(n_reports: int = 30, seed: int = 42, top_k: int = 5) -> dict:
-    """跑完整评测（分级），返回汇总指标（已落库）。"""
-    await store.init_store()
+    """跑完整评测（分级），返回汇总指标（已落库）。
+
+    FR-2 起评测跑在**独立评测库**（`finrag_eval`）上：本进程 store 连接池
+    指向评测库，`TRUNCATE/灌数据` 不再碰开发库。per_fact 写真正的逐题明细
+    （问题/档位/命中/top-k 来源/答案/拒答原因），可下钻到每一条 miss。
+    """
+    settings = get_settings()
+    eval_dsn = settings.resolved_eval_dsn
+    eval_db = await ensure_eval_database(settings.pg_dsn, eval_dsn)
+    await store.close_store()
+    await store.init_store(dsn=eval_dsn)
     await init_eval_store()
     reports = await _reset_and_seed(n_reports, seed)
     facts = all_facts(reports)
-    settings = get_settings()
 
     strategies = ("vector_only", "keyword_only", "hybrid")
     # 每策略每档的命中计数：[exact, paraphrase]
@@ -153,6 +168,9 @@ async def run_eval(n_reports: int = 30, seed: int = 42, top_k: int = 5) -> dict:
     faithfulness_claims = [0, 0]  # [supported, total]
     latencies: list[float] = []
     tier_sizes = [len(facts), sum(len(f.variants) for f in facts)]
+    # 守卫误拒：可回答问题被 check_sufficiency 拒掉的计数（按档）
+    guard_false_reject = [0, 0]
+    per_fact: list[dict] = []
 
     for fact in facts:
         # 评测计划：tier 0 = 原题（端到端问答也跑这档）；tier 1 = 同义改写题
@@ -169,13 +187,38 @@ async def run_eval(n_reports: int = 30, seed: int = 42, top_k: int = 5) -> dict:
             for st in ("keyword_only", "hybrid"):
                 if _evidence_chunk_hit(rows_by_strategy[st], fact.answer):
                     evidence_hits[st][tier] += 1
+            # 守卫误拒（FR-2）：拿同一份 hybrid 证据过确定性守卫，统计可回答
+            # 问题被误拒的比例——"证据换说法被拒"是 paraphrase 档最隐蔽的失败
+            guard_reason = check_sufficiency(q, rows_by_strategy["hybrid"])
+            if guard_reason:
+                guard_false_reject[tier] += 1
+            item: dict = {
+                "kind": "fact",
+                "fact_id": fact.fact_id,
+                "source": fact.source,
+                "tier": "exact" if tier == 0 else "paraphrase",
+                "question": q,
+                "retrieval_hit": {
+                    st: _source_hit(rows_by_strategy[st], fact.source) for st in strategies
+                },
+                "evidence_hit": {
+                    st: _evidence_chunk_hit(rows_by_strategy[st], fact.answer)
+                    for st in ("keyword_only", "hybrid")
+                },
+                "top_sources": {
+                    st: [r["source"] for r in rows_by_strategy[st][:top_k]]
+                    for st in strategies
+                },
+                "guard_refusal_reason": guard_reason,
+            }
             # 端到端问答只跑原题（改写题走检索对比即可，LLM 成本留给原题）
             if tier == 0:
                 from app.rag.graph import ask
 
                 started = time.perf_counter()
                 final = await ask(q, session_id=f"eval-{fact.fact_id}")
-                latencies.append((time.perf_counter() - started) * 1000)
+                latency_ms = (time.perf_counter() - started) * 1000
+                latencies.append(latency_ms)
 
                 want = _key_numbers(fact.answer)
                 got = final.get("answer", "")
@@ -187,10 +230,22 @@ async def run_eval(n_reports: int = 30, seed: int = 42, top_k: int = 5) -> dict:
                 )
                 faithfulness_claims[0] += sum(1 for v in verdicts if v.supported)
                 faithfulness_claims[1] += len(verdicts)
+                item.update({
+                    "answer": got,
+                    "status": final.get("status"),
+                    "answer_ok": ans_ok,
+                    "refusal_reason": final.get("refusal_reason"),
+                    "verdicts": [
+                        {"claim": v.claim, "supported": v.supported} for v in verdicts
+                    ],
+                    "latency_ms": round(latency_ms, 1),
+                })
+            per_fact.append(item)
 
     # ---- 拒答档：三类无答案题（D13）----
     hallucination_qs = build_hallucination_questions(reports)
     refuse_by_type: dict[str, list[int]] = {}
+    refusal_miss: list[int] = [0, 0]  # [漏拒, 总数]
     for hq in hallucination_qs:
         from app.rag.graph import ask
 
@@ -200,13 +255,23 @@ async def run_eval(n_reports: int = 30, seed: int = 42, top_k: int = 5) -> dict:
         bucket = refuse_by_type.setdefault(hq.htype, [0, 0])
         bucket[0] += int(ok)
         bucket[1] += 1
+        refusal_miss[0] += int(not ok)
+        refusal_miss[1] += 1
         # 判据交叉验证：拒答必须归因于充分性守卫或引用校验，
         # 不允许"检索碰巧为空"这种不可解释的拒答蒙混过关
-        assert ok is False or reason in {
-            "retrieval_empty",
-            "year_not_in_evidence",
-            "metric_not_in_evidence",
-        } or final.get("verdicts"), f"拒答 {hq.question} 归因不可解释: {reason}"
+        assert ok is False or reason in {*REFUSAL_REASONS, "retrieval_empty"} or final.get(
+            "verdicts"
+        ), f"拒答 {hq.question} 归因不可解释: {reason}"
+        per_fact.append({
+            "kind": "refusal",
+            "htype": hq.htype,
+            "question": hq.question,
+            "company": hq.company,
+            "status": final.get("status"),
+            "refusal_reason": reason,
+            "passed": ok,
+            "answer": final.get("answer", ""),
+        })
 
     # ---- 污染档：两个干净的指标，不混变量 ----
     # 1) 检索消融（top1 源准确率，anchor off/on）：问 A 时检索首位必须是
@@ -217,11 +282,13 @@ async def run_eval(n_reports: int = 30, seed: int = 42, top_k: int = 5) -> dict:
     top1 = {"anchor_off": [0, 0], "anchor_on": [0, 0]}
     contamination = [0, 0]
     for pair in pairs:
+        top1_hits: dict[str, bool] = {}
         for mode, anchor_on in (("anchor_off", False), ("anchor_on", True)):
             rows = await _search_strategy(
                 pair.question, "hybrid", None, top_k, anchor_on=anchor_on
             )
             hit = bool(rows) and rows[0]["source"].endswith("-" + pair.company)
+            top1_hits[mode] = hit
             top1[mode][0] += int(hit)
             top1[mode][1] += 1
         from app.rag.graph import ask
@@ -234,6 +301,17 @@ async def run_eval(n_reports: int = 30, seed: int = 42, top_k: int = 5) -> dict:
         has_a = any(n in got for n in a_num)
         contamination[0] += int(has_a and not leaked)
         contamination[1] += 1
+        per_fact.append({
+            "kind": "contamination",
+            "question": pair.question,
+            "company": pair.company,
+            "distractor_company": pair.distractor_company,
+            "top1": top1_hits,
+            "has_own_number": has_a,
+            "leaked_distractor": leaked,
+            "passed": bool(has_a and not leaked),
+            "answer": got,
+        })
 
     def _rate(num: int, den: int) -> float:
         return round(num / den, 4) if den else 0.0
@@ -246,6 +324,7 @@ async def run_eval(n_reports: int = 30, seed: int = 42, top_k: int = 5) -> dict:
         "n_docs": len(reports),
         "n_facts": len(facts),
         "top_k": top_k,
+        "eval_database": eval_db,
         # 检索命中：exact 档是管线自检（实体逐字出现，接近 100% 是结构属性），
         # paraphrase 档才是语义检索的质量声明——README 与简历只引用后者
         "retrieval_hit": {
@@ -267,6 +346,12 @@ async def run_eval(n_reports: int = 30, seed: int = 42, top_k: int = 5) -> dict:
         "refusal_accuracy": {
             htype: _rate(v[0], v[1]) for htype, v in sorted(refuse_by_type.items())
         },
+        # FR-2：误拒（可回答问题被守卫拒）与漏拒（无答案题没拒）分开报告
+        "guard_false_reject": {
+            "exact": _rate(guard_false_reject[0], tier_sizes[0]),
+            "paraphrase": _rate(guard_false_reject[1], tier_sizes[1]),
+        },
+        "refusal_miss_rate": _rate(refusal_miss[0], refusal_miss[1]),
         # 污染档两个指标：top1 是检索消融（只动检索），contamination 是答案级
         # 系统行为（走默认管线）——分开报告，不把两个变量混成一个数
         "top1_source_accuracy": {
@@ -288,9 +373,12 @@ async def run_eval(n_reports: int = 30, seed: int = 42, top_k: int = 5) -> dict:
             " VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)",
             settings.embedding_mode, seed, len(facts),
             json.dumps(metrics, ensure_ascii=False),
-            json.dumps({"tier_sizes": tier_sizes}, ensure_ascii=False),
+            json.dumps(
+                {"tier_sizes": tier_sizes, "items": per_fact}, ensure_ascii=False
+            ),
         )
 
+    await store.close_store()
     log.info("eval.done", extra={"context": metrics})
     return metrics
 
@@ -329,6 +417,9 @@ def main() -> None:
         print(_fmt_row(f"证据块命中 {st} (paraphrase)", collect(["evidence_chunk_hit", st, "paraphrase"])))
     print(_fmt_row("answer_accuracy", collect(["answer_accuracy"])))
     print(_fmt_row("citation_faithfulness", collect(["citation_faithfulness"])))
+    print(_fmt_row("守卫误拒 (exact)", collect(["guard_false_reject", "exact"])))
+    print(_fmt_row("守卫误拒 (paraphrase)", collect(["guard_false_reject", "paraphrase"])))
+    print(_fmt_row("拒答漏拒率", collect(["refusal_miss_rate"])))
     for htype in runs[0]["refusal_accuracy"]:
         print(_fmt_row(f"拒答率 {htype}", collect(["refusal_accuracy", htype])))
     print(_fmt_row("检索 top1 源准确率 (anchor off)", collect(["top1_source_accuracy", "anchor_off"])))

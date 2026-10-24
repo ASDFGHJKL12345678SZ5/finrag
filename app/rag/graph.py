@@ -217,32 +217,29 @@ def route_after_verify(state: RAGState) -> Literal["rewrite_query", "__end__"]:
 
 
 def rewrite_query(state: RAGState) -> dict:
-    """重试前改写查询：把缺失的证据词并回问题，提高下一轮召回命中率。
+    """重试前改写查询：只用原问题的实体与指标同义词扩展。
 
-    只拼真实证据词（数字/中文实词）——verdict 里的状态词（如"无对应
-    引用"）拼进问题会污染查询，让下一轮检索更偏。
+    FR-7 修复：旧版把 verdict 的 `missing` 里的**数字**拼回查询——那些数字
+    正是校验判定"不在证据里"的幻觉数字，拼回去等于把编造的数字写进检索词，
+    下一轮检索要么空手而归，要么被这些数字带到无关文档（"5"还会命中"56.4"）。
+    现在只用两样可回溯的东西：原问题（含公司实体）+ 指标同义词典里该问题
+    命中的说法（如"总收入"扩展出注册说法"营业收入"），不引入任何新数字。
     """
-    missing: list[str] = []
-    for v in state.get("verdicts") or []:
-        for term in v.get("missing") or []:
-            if _NUM_RE.match(term) or re.fullmatch(r"[一-龥]{2,}", term):
-                missing.append(term)
-    # 上一轮改写过的查询只取主干（第一个空格前的原始问题）
-    # 依托 original_question 重建：早期版取 question.split(" ")[0] 会把
-    # "What is 宁德润能 2025 revenue?" 截成 "What"——中文无空格所以
-    # 36 个测试和全中文评测都没暴露，中英混合提问重试必残。
+    from app.rag.metric_lexicon import METRIC_GROUPS, metric_terms_in
+
     base = state.get("original_question") or state["question"]
-    rewritten = (
-        base + " " + " ".join(dict.fromkeys(missing)) if missing else base + " 详细数据"
-    )
+    extras: list[str] = []
+    for canonical, _found in metric_terms_in(base):
+        for term in (canonical, *METRIC_GROUPS[canonical]):
+            if term not in base and term not in extras:
+                extras.append(term)
+    extras = extras[:3]
+    rewritten = base + (" " + " ".join(extras) if extras else "")
     return {
         "question": rewritten,
         "retry_count": state.get("retry_count", 0) + 1,
         "trace": [_step("rewrite_query", time.perf_counter(), rewritten=rewritten)],
     }
-
-
-_NUM_RE = re.compile(r"\d+(?:\.\d+)?%?$")
 
 
 def _build_prompt(question: str, chunks: list[dict]) -> str:

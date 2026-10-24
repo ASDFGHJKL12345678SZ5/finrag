@@ -95,12 +95,17 @@ async def _ensure_hnsw_opclass(conn) -> None:
         "ON rag.chunks USING hnsw (embedding vector_cosine_ops)"
     )
 
-async def init_store() -> asyncpg.Pool:
-    """建 schema（幂等）并返回连接池。"""
+async def init_store(dsn: str | None = None) -> asyncpg.Pool:
+    """建 schema（幂等）并返回连接池。
+
+    dsn 参数（FR-2）：评测进程传入独立评测库 DSN，**同一个进程内所有
+    store.get_pool() 调用都走它**——评测的 TRUNCATE/灌数据因此只作用于
+    评测库，绝不碰开发库。业务进程（API）不传，沿用 settings.pg_dsn。
+    """
     global _pool
     settings = get_settings()
     _pool = await asyncpg.create_pool(
-        settings.pg_dsn, min_size=settings.pg_pool_min, max_size=settings.pg_pool_max
+        dsn or settings.pg_dsn, min_size=settings.pg_pool_min, max_size=settings.pg_pool_max
     )
     async with _pool.acquire() as conn:
         await conn.execute("CREATE SCHEMA IF NOT EXISTS rag")
@@ -135,10 +140,13 @@ async def init_store() -> asyncpg.Pool:
 
 
 async def close_store() -> None:
-    global _pool
+    """关闭连接池（评测进程切换 DSN / 测试收尾用）；同时清公司名缓存。"""
+    global _pool, _company_cache, _company_cache_at
     if _pool is not None:
         await _pool.close()
         _pool = None
+    _company_cache = None
+    _company_cache_at = 0.0
 
 
 def get_pool() -> asyncpg.Pool:

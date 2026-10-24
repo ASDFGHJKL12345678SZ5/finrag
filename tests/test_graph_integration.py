@@ -23,6 +23,7 @@ from app.rag import store
 from app.rag.corpus import build_corpus
 from app.rag.graph import ask
 from app.rag.graph import route_after_verify as g_route
+from app.rag.graph import verify
 from app.rag.ingest import ingest_report
 
 ensure_selector_loop()
@@ -63,6 +64,36 @@ def test_rewrite_query_保留原始问题实体():
     q = out["question"]
     assert "宁德润能" in q, f"改写后丢了公司实体: {q}"
     assert len(q) >= 8, f"改写把问题截断了: {q}"
+
+
+def test_rewrite_query_不拼回缺失数字():
+    """FR-7：verdict.missing 里的数字正是校验判"不在证据里"的幻觉数字，
+    拼回查询等于把编造的数字写进检索词。"""
+    from app.rag.graph import rewrite_query
+
+    state = {
+        "question": "宁德润能2025年的营业收入是多少？",
+        "original_question": "宁德润能2025年的营业收入是多少？",
+        "retry_count": 1,
+        "verdicts": [{"missing": ["999.99亿元", "5%", "内容词命中不足(0/5)"]}],
+    }
+    q = rewrite_query(state)["question"]
+    assert "999.99" not in q and "5%" not in q
+    assert "宁德润能" in q
+
+
+def test_rewrite_query_用指标同义词扩展():
+    """改写只允许用可回溯的指标词扩展：问"总收入"时补注册说法"营业收入"。"""
+    from app.rag.graph import rewrite_query
+
+    state = {
+        "question": "宁德润能2025年的总收入是多少？",
+        "original_question": "宁德润能2025年的总收入是多少？",
+        "retry_count": 1,
+        "verdicts": [],
+    }
+    q = rewrite_query(state)["question"]
+    assert "营业收入" in q, f"改写没有做指标同义扩展: {q}"
 
 
 def test_空检索时verify判insufficient而不是崩溃():
@@ -113,12 +144,24 @@ def test_正常问答走通并带有效引用():
 
 
 def test_幻觉答案被引用校验拦截():
-    """mock 的幻觉型触发词会编造语料里不存在的数字——必须拒答。"""
+    """编造的数字必须被引用校验拦住。
+
+    FR-2 后"预测/未来三年"这类题在 check_sufficiency 就被拒了（生成前），
+    走不到 verify——所以这里直接驱动 verify 节点：先取一份真实检索证据，
+    再用 mock 的幻觉文案替换答案，验证 verify 仍会把"无据数字"判成 insufficient。
+    """
     async def body():
         await _reset_and_seed(10, 42)
-        final = await ask("预测宁德润能未来三年营收")
-        assert final["status"] == "insufficient", "编造的数字必须被拦截"
-        assert any(not v["supported"] for v in final.get("verdicts") or [])
+        seeded = await ask("宁德润能2025年的营业收入是多少")
+        chunks = seeded["retrieved"]
+        assert chunks, "先要有真实检索证据"
+        out = await verify({
+            "question": "宁德润能2025年的营业收入是多少",
+            "retrieved": chunks,
+            "answer": "根据研报分析，预期值为 999.99 亿元，远超行业平均水平。[c1]",
+        })
+        assert out["status"] == "insufficient", "编造的数字必须被拦截"
+        assert any(not v["supported"] for v in out.get("verdicts") or [])
 
     _run(body)
 
@@ -129,7 +172,8 @@ def test_拒答时检索链路仍然完整():
         await _reset_and_seed(10, 42)
         final = await ask("预测宁德润能未来三年营收")
         nodes = [t["node"] for t in final.get("trace") or []]
-        assert "retrieve" in nodes and "verify" in nodes
+        # FR-2 起未来预测题在 check_sufficiency 就拒答，不再进入 verify
+        assert "retrieve" in nodes and "check_sufficiency" in nodes
 
     _run(body)
 

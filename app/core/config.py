@@ -7,6 +7,7 @@
 - pg_dsn 默认指向 localhost 开发实例；容器内部署由 compose 注入服务名
 """
 from functools import lru_cache
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,8 +23,19 @@ class Settings(BaseSettings):
     pg_dsn: str = Field(
         default="postgresql://postgres:postgres@localhost:5433/finrag"
     )
+    # 评测专用库（FR-2）：默认由 pg_dsn 派生 <db>_eval，评测只 TRUNCATE 这里，
+    # 绝不再动开发库 rag.documents。显式设置 EVAL_PG_DSN 可覆盖。
+    eval_pg_dsn: str = ""
     pg_pool_min: int = 2
     pg_pool_max: int = 10
+
+    @property
+    def resolved_eval_dsn(self) -> str:
+        if self.eval_pg_dsn:
+            return self.eval_pg_dsn
+        parts = urlsplit(self.pg_dsn)
+        db = (parts.path or "/finrag").lstrip("/") or "finrag"
+        return urlunsplit(parts._replace(path="/" + db + "_eval"))
 
     # ---- Embedding ----
     # bge-small-zh-v1.5：本地 ONNX 推理，中文金融语料够用，维度 512
