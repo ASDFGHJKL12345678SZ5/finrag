@@ -26,22 +26,61 @@ def test_识别行业极值问题():
     assert spec2 is not None and spec2.metric == "归母净利润"
 
 
+def test_行业二字只是可选加强():
+    """R1：有/没有“行业”二字，识别结果必须一致。"""
+    with_word = detect_aggregate("食品饮料行业2024年营业收入最高的公司是哪家？")
+    without_word = detect_aggregate("食品饮料2024年营业收入最高的公司是哪家？")
+    assert with_word == without_word
+    assert without_word is not None
+
+
+@pytest.mark.parametrize(
+    ("question", "industry", "year", "metric"),
+    [
+        # R1 验收：不带“行业”二字、带行业词 + 居首/最高/第一的 6 种问法
+        ("银行2022年营收居首的公司是哪家？", "银行", 2022, "营业收入"),
+        ("半导体2024年营业收入最高的公司是哪家？", "半导体", 2024, "营业收入"),
+        ("医药生物2021年归母净利润第一的是哪家？", "医药生物", 2021, "归母净利润"),
+        ("食品饮料2025年毛利率最高的是哪家公司？", "食品饮料", 2025, "毛利率"),
+        ("新能源2023年研发费用率榜首的公司", "新能源", 2023, "研发费用率"),
+        ("银行2025年经营现金流最大的是哪家？", "银行", 2025, "经营性现金流"),
+    ],
+)
+def test_不带行业二字也能识别(question, industry, year, metric):
+    spec = detect_aggregate(question)
+    assert spec is not None, f"未识别：{question}"
+    assert (spec.industry, spec.year, spec.metric) == (industry, year, metric)
+
+
 @pytest.mark.parametrize(
     "question",
     [
-        "宁德润能2024年的营业收入是多少？",      # 没行业/极值词
-        "新能源行业2024年的营业收入是多少？",    # 极值词缺失
-        "新能源行业营业收入最高的公司是哪家？",  # 年份缺失
-        "新能源行业2024年营收最高的公司是哪家？",  # 行业词不在问题里（是"新能源"）
+        "宁德润能2024年的营业收入是多少？",      # 无行业词、无极值词
+        "新能源2024年的营业收入是多少？",        # 有行业词+年份+指标，无极值语义
+        "银行业2024年营收是多少？",              # R1 反向测试：不得误触发聚合
+        "半导体行业2024年毛利率是多少？",        # 同上（带“行业”也不触发）
+        "新能源营业收入最高的公司是哪家？",      # 缺年份
+        "2024年营业收入最高的公司是哪家？",      # 缺行业词
     ],
 )
 def test_非聚合问题不误触发(question):
-    # 第 4 条含"新能源"+"行业"，会被识别——它是合法聚合问法；
-    # 这里只断言前三条为 None，最后一条单独放行
-    if question.startswith("新能源行业2024年营收"):
-        assert detect_aggregate(question) is not None
-    else:
-        assert detect_aggregate(question) is None
+    assert detect_aggregate(question) is None
+
+
+def test_行业词表取自语料元信息(monkeypatch):
+    """R1：词表由 corpus.INDUSTRIES（Report.industry 取值集合）派生，不手写。
+
+    把语料元信息临时扩成含“白酒/乳业”的行业，识别立即生效——如果词表是
+    本模块手写的常量，这两个词不可能被识别。反向：元信息里没有的“教育”
+    不能凭空识别。
+    """
+    from app.rag import corpus
+
+    monkeypatch.setattr(corpus, "INDUSTRIES", [*corpus.INDUSTRIES, "白酒", "乳业"])
+    for word in ("白酒", "乳业"):
+        spec = detect_aggregate(f"{word}2022年营收居首的公司是哪家？")
+        assert spec is not None and spec.industry == word
+    assert detect_aggregate("教育2022年营收居首的公司是哪家？") is None
 
 
 def _run(body):

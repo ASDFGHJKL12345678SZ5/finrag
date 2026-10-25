@@ -20,7 +20,20 @@ from app.rag import store
 
 log = get_logger("aggregate")
 
-INDUSTRY_WORDS = ("新能源", "半导体", "医药生物", "食品饮料", "银行")
+
+def industry_words() -> tuple[str, ...]:
+    """行业词表 = 语料元信息 `industry` 字段的取值集合，本模块不手写。
+
+    R1：旧版在这里手写 `("新能源", "半导体", ...)`，与语料生成器各维护一份；
+    语料换行业/加行业时两处会漂移。词表只从 `corpus.INDUSTRIES`（也就是
+    `Report.industry` 的全部取值）派生，检测逻辑对任意行业自动生效。
+    函数内导入是为了让"词表随语料元信息变化"可被单测直接验证（monkeypatch
+    `corpus.INDUSTRIES` 后立即生效），也避免导入本模块时把语料生成器拖进来。
+    """
+    from app.rag.corpus import INDUSTRIES
+
+    return tuple(INDUSTRIES)
+
 # 顺序有意义：先匹配更具体的指标，避免"净利润"被"收入"这类泛词抢走
 _METRIC_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("归母净利润", ("归母净利润", "净利润", "净利")),
@@ -47,10 +60,17 @@ class AggregateSpec:
 
 
 def detect_aggregate(question: str) -> AggregateSpec | None:
-    """识别行业极值问题；不是这类问题返回 None（走普通 RAG 链路）。"""
-    if "行业" not in question:
-        return None
-    industry = next((w for w in INDUSTRY_WORDS if w in question), None)
+    """识别行业极值问题；不是这类问题返回 None（走普通 RAG 链路）。
+
+    判据是四项同时命中：**行业词**（语料 industry 取值）+ 极值词 + 年份 + 指标。
+    "行业"二字只是可选的加强词，不再是必要条件——留出集 v1 的失败题写的是
+    "银行 2022 年营收居首的公司"，不含"行业"，旧判据（`"行业" not in question`）
+    直接漏判，退回单文档 RAG 后只能在个别公司里挑，industry_max 0/6。
+    """
+    industry = next(
+        (w for w in sorted(industry_words(), key=len, reverse=True) if w in question),
+        None,
+    )
     if not industry:
         return None
     if not any(w in question for w in _SUPERLATIVE_WORDS):

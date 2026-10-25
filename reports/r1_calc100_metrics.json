@@ -1,0 +1,254 @@
+{
+ "mode": "local",
+ "split": "train",
+ "years": [
+  2021,
+  2022,
+  2023,
+  2024,
+  2025
+ ],
+ "llm_mode": "real",
+ "n_chunks": 8000,
+ "n_reports": 1000,
+ "retrieval": {
+  "rrf": {
+   "abbr": {
+    "n": 0,
+    "mrr": 0.0,
+    "recall@5": 0.0,
+    "evidence_hit": 0.0
+   },
+   "exact": {
+    "n": 0,
+    "mrr": 0.0,
+    "recall@5": 0.0,
+    "evidence_hit": 0.0
+   },
+   "refusal": {
+    "n": 0,
+    "mrr": 0.0,
+    "recall@5": 0.0,
+    "evidence_hit": 0.0
+   },
+   "calculation": {
+    "n": 100,
+    "mrr": 0.795,
+    "recall@5": 0.82,
+    "evidence_hit": 0.55
+   }
+  },
+  "hybrid": {
+   "abbr": {
+    "n": 0,
+    "mrr": 0.0,
+    "recall@5": 0.0,
+    "evidence_hit": 0.0
+   },
+   "exact": {
+    "n": 0,
+    "mrr": 0.0,
+    "recall@5": 0.0,
+    "evidence_hit": 0.0
+   },
+   "refusal": {
+    "n": 0,
+    "mrr": 0.0,
+    "recall@5": 0.0,
+    "evidence_hit": 0.0
+   },
+   "calculation": {
+    "n": 100,
+    "mrr": 0.792,
+    "recall@5": 0.81,
+    "evidence_hit": 0.61
+   }
+  },
+  "vector_only": {
+   "abbr": {
+    "n": 0,
+    "mrr": 0.0,
+    "recall@5": 0.0,
+    "evidence_hit": 0.0
+   },
+   "exact": {
+    "n": 0,
+    "mrr": 0.0,
+    "recall@5": 0.0,
+    "evidence_hit": 0.0
+   },
+   "refusal": {
+    "n": 0,
+    "mrr": 0.0,
+    "recall@5": 0.0,
+    "evidence_hit": 0.0
+   },
+   "calculation": {
+    "n": 100,
+    "mrr": 0.6987,
+    "recall@5": 0.77,
+    "evidence_hit": 0.42
+   }
+  },
+  "keyword_only": {
+   "abbr": {
+    "n": 0,
+    "mrr": 0.0,
+    "recall@5": 0.0,
+    "evidence_hit": 0.0
+   },
+   "exact": {
+    "n": 0,
+    "mrr": 0.0,
+    "recall@5": 0.0,
+    "evidence_hit": 0.0
+   },
+   "refusal": {
+    "n": 0,
+    "mrr": 0.0,
+    "recall@5": 0.0,
+    "evidence_hit": 0.0
+   },
+   "calculation": {
+    "n": 100,
+    "mrr": 0.545,
+    "recall@5": 0.8,
+    "evidence_hit": 0.6
+   }
+  }
+ },
+ "latency_ms": {
+  "p50": 654.3,
+  "p95": 926.9
+ },
+ "corpus_seed": 42,
+ "n_companies": 200,
+ "n_questions": 100,
+ "seed_time_s": 118.2,
+ "evaluated_at": "2026-10-25T00:51:42.387296+00:00",
+ "eval_database": "finrag_eval",
+ "end2end_sample": 100,
+ "answer_accuracy": {
+  "abbr": null,
+  "exact": null,
+  "calculation": 1.0
+ },
+ "overall_accuracy": null,
+ "refusal_accuracy": {},
+ "refusal_miss_rate": 0.0,
+ "guard_false_reject": {
+  "abbr": 0.0,
+  "exact": 0.0,
+  "calculation": 0.0
+ },
+ "citation_repair_rate": 0.1,
+ "retrieval_by_subtype": {
+  "rrf": {
+   "yoy": {
+    "n": 40,
+    "mrr": 1.0,
+    "recall@5": 1.0,
+    "evidence_hit": 1.0
+   },
+   "yoy_diff": {
+    "n": 20,
+    "mrr": 0.975,
+    "recall@5": 1.0,
+    "evidence_hit": 0.0
+   },
+   "industry_max": {
+    "n": 20,
+    "mrr": 0.025,
+    "recall@5": 0.1,
+    "evidence_hit": 0.1
+   },
+   "segment_share": {
+    "n": 20,
+    "mrr": 0.975,
+    "recall@5": 1.0,
+    "evidence_hit": 0.65
+   }
+  },
+  "hybrid": {
+   "yoy": {
+    "n": 40,
+    "mrr": 1.0,
+    "recall@5": 1.0,
+    "evidence_hit": 1.0
+   },
+   "yoy_diff": {
+    "n": 20,
+    "mrr": 0.975,
+    "recall@5": 1.0,
+    "evidence_hit": 0.0
+   },
+   "industry_max": {
+    "n": 20,
+    "mrr": 0.01,
+    "recall@5": 0.05,
+    "evidence_hit": 0.05
+   },
+   "segment_share": {
+    "n": 20,
+    "mrr": 0.975,
+    "recall@5": 1.0,
+    "evidence_hit": 1.0
+   }
+  },
+  "vector_only": {
+   "yoy": {
+    "n": 40,
+    "mrr": 1.0,
+    "recall@5": 1.0,
+    "evidence_hit": 1.0
+   },
+   "yoy_diff": {
+    "n": 20,
+    "mrr": 0.95,
+    "recall@5": 0.95,
+    "evidence_hit": 0.0
+   },
+   "industry_max": {
+    "n": 20,
+    "mrr": 0.025,
+    "recall@5": 0.1,
+    "evidence_hit": 0.1
+   },
+   "segment_share": {
+    "n": 20,
+    "mrr": 0.5183,
+    "recall@5": 0.8,
+    "evidence_hit": 0.0
+   }
+  },
+  "keyword_only": {
+   "yoy": {
+    "n": 40,
+    "mrr": 0.5,
+    "recall@5": 1.0,
+    "evidence_hit": 1.0
+   },
+   "yoy_diff": {
+    "n": 20,
+    "mrr": 0.725,
+    "recall@5": 1.0,
+    "evidence_hit": 0.0
+   },
+   "industry_max": {
+    "n": 20,
+    "mrr": 0.0,
+    "recall@5": 0.0,
+    "evidence_hit": 0.0
+   },
+   "segment_share": {
+    "n": 20,
+    "mrr": 1.0,
+    "recall@5": 1.0,
+    "evidence_hit": 1.0
+   }
+  }
+ },
+ "citation_faithfulness": 1.0,
+ "answer_accuracy_overall": 1.0,
+ "citation_faithfulness_before": 1.0
+}

@@ -35,7 +35,12 @@ from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from app.core.logging import get_logger
-from app.rag.aggregate import AggregateSpec, answer_aggregate, detect_aggregate
+from app.rag.aggregate import (
+    AggregateSpec,
+    answer_aggregate,
+    detect_aggregate,
+    industry_words,
+)
 from app.rag.llm import get_llm
 from app.rag.retrieve import hybrid_search
 from app.rag.sufficiency import check_sufficiency
@@ -44,9 +49,6 @@ from app.rag.verify import repair_citations, verify_answer
 log = get_logger("graph")
 
 MAX_RETRIES = 2
-
-# 行业词表：查询理解只做"从问题里识别行业过滤条件"这一件事
-_INDUSTRY_WORDS = ("新能源", "半导体", "医药生物", "食品饮料", "银行")
 
 
 class RAGState(TypedDict, total=False):
@@ -80,7 +82,7 @@ async def understand_query(state: RAGState) -> dict:
     """查询理解：识别行业过滤条件 + 抽取关键实体词 + 聚合意图。"""
     started = time.perf_counter()
     q = state["question"]
-    industry = next((w for w in _INDUSTRY_WORDS if w in q), None)
+    industry = next((w for w in industry_words() if w in q), None)
     entities = [t for t in re.findall(r"[一-龥A-Za-z0-9]{2,}", q)][:6]
     spec = detect_aggregate(q)
     log.info(
