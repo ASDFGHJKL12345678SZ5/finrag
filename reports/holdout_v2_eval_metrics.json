@@ -15,15 +15,15 @@
   "rrf": {
    "abbr": {
     "n": 60,
-    "mrr": 0.5839,
-    "recall@5": 0.6333,
-    "evidence_hit": 0.6333
+    "mrr": 0.6833,
+    "recall@5": 0.7167,
+    "evidence_hit": 0.7167
    },
    "exact": {
     "n": 80,
-    "mrr": 0.9608,
+    "mrr": 0.9573,
     "recall@5": 1.0,
-    "evidence_hit": 0.9625
+    "evidence_hit": 0.975
    },
    "refusal": {
     "n": 0,
@@ -35,21 +35,21 @@
     "n": 20,
     "mrr": 0.65,
     "recall@5": 0.7,
-    "evidence_hit": 0.6
+    "evidence_hit": 0.55
    }
   },
   "hybrid": {
    "abbr": {
     "n": 60,
-    "mrr": 0.7181,
-    "recall@5": 0.8833,
-    "evidence_hit": 0.8833
+    "mrr": 0.7978,
+    "recall@5": 0.9333,
+    "evidence_hit": 0.9333
    },
    "exact": {
     "n": 80,
-    "mrr": 0.9608,
+    "mrr": 0.9479,
     "recall@5": 1.0,
-    "evidence_hit": 0.9625
+    "evidence_hit": 0.975
    },
    "refusal": {
     "n": 0,
@@ -67,15 +67,15 @@
   "vector_only": {
    "abbr": {
     "n": 60,
-    "mrr": 0.5556,
-    "recall@5": 0.6333,
-    "evidence_hit": 0.6333
+    "mrr": 0.6625,
+    "recall@5": 0.7167,
+    "evidence_hit": 0.7167
    },
    "exact": {
     "n": 80,
-    "mrr": 0.704,
-    "recall@5": 0.775,
-    "evidence_hit": 0.75
+    "mrr": 0.7265,
+    "recall@5": 0.8,
+    "evidence_hit": 0.775
    },
    "refusal": {
     "n": 0,
@@ -85,15 +85,15 @@
    },
    "calculation": {
     "n": 20,
-    "mrr": 0.475,
-    "recall@5": 0.5,
+    "mrr": 0.4875,
+    "recall@5": 0.55,
     "evidence_hit": 0.4
    }
   },
   "keyword_only": {
    "abbr": {
     "n": 60,
-    "mrr": 0.8483,
+    "mrr": 0.8728,
     "recall@5": 0.95,
     "evidence_hit": 0.9333
    },
@@ -118,22 +118,22 @@
   }
  },
  "latency_ms": {
-  "p50": 732.6,
-  "p95": 1194.3
+  "p50": 742.3,
+  "p95": 1140.7
  },
  "corpus_seed": 20261111,
  "n_companies": 200,
  "n_questions": 200,
- "seed_time_s": 118.4,
- "evaluated_at": "2026-10-25T03:48:53.181290+00:00",
+ "seed_time_s": 117.9,
+ "evaluated_at": "2026-10-25T04:55:04.317410+00:00",
  "eval_database": "finrag_eval",
  "end2end_sample": 160,
  "answer_accuracy": {
-  "abbr": 0.8,
-  "exact": 0.9625,
+  "abbr": 0.95,
+  "exact": 0.975,
   "calculation": 1.0
  },
- "overall_accuracy": 0.925,
+ "overall_accuracy": 0.975,
  "refusal_accuracy": {
   "wrong_year": 1.0,
   "future_marked": 1.0,
@@ -147,24 +147,24 @@
   "exact": 0.0,
   "calculation": 0.0
  },
- "citation_repair_rate": 0.0938,
+ "citation_repair_rate": 0.0,
  "retrieval_by_subtype": {
   "rrf": {
    "yoy": {
     "n": 8,
-    "mrr": 1.0,
+    "mrr": 0.9375,
     "recall@5": 1.0,
     "evidence_hit": 1.0
    },
    "abbr": {
     "n": 60,
-    "mrr": 0.5839,
-    "recall@5": 0.6333,
-    "evidence_hit": 0.6333
+    "mrr": 0.6833,
+    "recall@5": 0.7167,
+    "evidence_hit": 0.7167
    },
    "毛利率": {
     "n": 13,
-    "mrr": 0.8974,
+    "mrr": 0.891,
     "recall@5": 1.0,
     "evidence_hit": 1.0
    },
@@ -176,21 +176,21 @@
    },
    "同比增长": {
     "n": 14,
-    "mrr": 0.9429,
+    "mrr": 1.0,
     "recall@5": 1.0,
-    "evidence_hit": 0.7857
+    "evidence_hit": 0.8571
    },
    "营业收入": {
     "n": 14,
-    "mrr": 0.9643,
+    "mrr": 0.9286,
     "recall@5": 1.0,
     "evidence_hit": 1.0
    },
    "segment_share": {
     "n": 6,
-    "mrr": 0.8333,
+    "mrr": 0.9167,
     "recall@5": 1.0,
-    "evidence_hit": 0.6667
+    "evidence_hit": 0.5
    },
    "归母净利润": {
     "n": 13,
@@ -200,7 +200,7 @@
    },
    "研发费用率": {
     "n": 13,
-    "mrr": 1.0,
+    "mrr": 0.9615,
     "recall@5": 1.0,
     "evidence_hit": 1.0
    },
@@ -220,9 +220,9 @@
    },
    "abbr": {
     "n": 60,
-    "mrr": 0.7181,
-    "recall@5": 0.8833,
-    "evidence_hit": 0.8833
+    "mrr": 0.7978,
+    "recall@5": 0.9333,
+    "evidence_hit": 0.9333
    },
    "毛利率": {
     "n": 13,
@@ -238,13 +238,13 @@
    },
    "同比增长": {
     "n": 14,
-    "mrr": 0.9429,
+    "mrr": 1.0,
     "recall@5": 1.0,
-    "evidence_hit": 0.7857
+    "evidence_hit": 0.8571
    },
    "营业收入": {
     "n": 14,
-    "mrr": 0.9643,
+    "mrr": 0.869,
     "recall@5": 1.0,
     "evidence_hit": 1.0
    },
@@ -262,7 +262,7 @@
    },
    "研发费用率": {
     "n": 13,
-    "mrr": 1.0,
+    "mrr": 0.9615,
     "recall@5": 1.0,
     "evidence_hit": 1.0
    },
@@ -276,21 +276,21 @@
   "vector_only": {
    "yoy": {
     "n": 8,
-    "mrr": 1.0,
-    "recall@5": 1.0,
-    "evidence_hit": 1.0
+    "mrr": 0.875,
+    "recall@5": 0.875,
+    "evidence_hit": 0.875
    },
    "abbr": {
     "n": 60,
-    "mrr": 0.5556,
-    "recall@5": 0.6333,
-    "evidence_hit": 0.6333
+    "mrr": 0.6625,
+    "recall@5": 0.7167,
+    "evidence_hit": 0.7167
    },
    "毛利率": {
     "n": 13,
-    "mrr": 0.3744,
-    "recall@5": 0.5385,
-    "evidence_hit": 0.5385
+    "mrr": 0.4897,
+    "recall@5": 0.6923,
+    "evidence_hit": 0.6154
    },
    "industry_max": {
     "n": 6,
@@ -300,33 +300,33 @@
    },
    "同比增长": {
     "n": 14,
-    "mrr": 0.4786,
-    "recall@5": 0.5714,
-    "evidence_hit": 0.5
+    "mrr": 0.75,
+    "recall@5": 0.7857,
+    "evidence_hit": 0.7857
    },
    "营业收入": {
     "n": 14,
-    "mrr": 0.8571,
+    "mrr": 0.8214,
     "recall@5": 0.9286,
-    "evidence_hit": 0.9286
+    "evidence_hit": 0.8571
    },
    "segment_share": {
     "n": 6,
-    "mrr": 0.25,
-    "recall@5": 0.3333,
-    "evidence_hit": 0.0
+    "mrr": 0.4583,
+    "recall@5": 0.6667,
+    "evidence_hit": 0.1667
    },
    "归母净利润": {
     "n": 13,
-    "mrr": 0.5962,
-    "recall@5": 0.6923,
-    "evidence_hit": 0.6923
+    "mrr": 0.5192,
+    "recall@5": 0.6154,
+    "evidence_hit": 0.6154
    },
    "研发费用率": {
     "n": 13,
-    "mrr": 0.9231,
-    "recall@5": 0.9231,
-    "evidence_hit": 0.8462
+    "mrr": 0.7692,
+    "recall@5": 0.7692,
+    "evidence_hit": 0.7692
    },
    "经营性现金流": {
     "n": 13,
@@ -344,7 +344,7 @@
    },
    "abbr": {
     "n": 60,
-    "mrr": 0.8483,
+    "mrr": 0.8728,
     "recall@5": 0.95,
     "evidence_hit": 0.9333
    },
@@ -398,7 +398,7 @@
    }
   }
  },
- "citation_faithfulness": 0.9076,
- "answer_accuracy_overall": 0.9062,
- "citation_faithfulness_before": 0.9293
+ "citation_faithfulness": 0.9938,
+ "answer_accuracy_overall": 0.9688,
+ "citation_faithfulness_before": 0.9937
 }
