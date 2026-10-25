@@ -469,14 +469,20 @@ async def keyword_search(
         if any(s in query for s in synonyms):
             for s in (canonical, *synonyms):
                 metric_terms.update(_extract_terms(s, limit=12))
-    # "占比/比重/份额"类问题要的是分业务表（表头含"业务板块/收入/占比"），
-    # 先加这些词再扩指标同义词——否则 24 词上限会被营收同义词占满，
-    # 分业务表反而排到第 12 名（FR-1 实测 segment_share 8/20）
-    if any(k in query for k in ("占比", "比重", "份额")):
-        for term in _extract_terms("占比 比重 业务 板块", limit=16):
+    # "占比/比重/份额/比例/百分比/贡献"类问题要的是分业务表（表头含
+    # "业务板块/收入/占比"），先加这些词再扩指标同义词——否则 24 词上限会被
+    # 营收同义词占满，分业务表反而排到第 12 名（FR-1 实测 segment_share 8/20）。
+    # Q4：v2 的自然说法是"贡献了多大比例/占整体收入的百分之几"，只认
+    # 占比/比重/份额会漏；把比例/百分比/百分之几/贡献也纳入。
+    if any(k in query for k in ("占比", "比重", "份额", "比例", "百分比", "百分之几", "贡献")):
+        for term in _extract_terms(
+            "占比 比重 比例 百分比 百分之几 分业务 业务 板块 收入", limit=16
+        ):
             if term not in terms:
                 terms.append(term)
-        metric_terms.update(_extract_terms("占比 比重 业务 板块", limit=16))
+        metric_terms.update(_extract_terms(
+            "占比 比重 比例 百分比 百分之几 分业务 业务 板块 收入", limit=16
+        ))
 
     for extra in expand_metric_terms(query):
         # 索引按 2 字二元组建词（中文整段切分不可靠）：扩词也要拆成二元组，

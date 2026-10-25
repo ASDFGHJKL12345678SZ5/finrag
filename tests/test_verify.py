@@ -215,3 +215,47 @@ def test_礼貌拒答终态判insufficient():
     out = asyncio.run(verify(state))
     assert out["status"] == "insufficient"
     assert out["refusal_reason"] == "model_declined"
+
+
+def test_小数开头的裸数字不被当列表序号():
+    """Q3 根因：`100.00亿元` 曾被列表序号规则吃掉整数部分，只剩 `00亿元`。"""
+    assert split_claims("100.00亿元[c1]") == [("100.00亿元", "c1")]
+
+
+def test_短数字论断有引用可通过():
+    """Q3：只有“亿元”一个内容词的短论断，不应被 2 个二元组门禁误杀。"""
+    from app.rag.verify import verify_answer
+
+    chunks = [_chunk("c1", "甲公司2025年营业收入100.00亿元。")]
+    passed, _ratio, verdicts = verify_answer("100.00亿元[c1]", chunks)
+    assert passed and all(v.supported for v in verdicts)
+
+
+def test_裸数字按问题上下文修复引用():
+    """Q3：只回“100.00亿元[c1]”时，按问题里的公司/年份/指标找到正确块。"""
+    from app.rag.verify import repair_citations, verify_answer
+
+    chunks = [
+        {"citation_id": "c1", "source": "新能源-000-甲公司-2025", "text": "甲公司2025年经营正常。"},
+        {"citation_id": "c2", "source": "新能源-000-甲公司-2025", "text": "甲公司2025年营业收入100.00亿元。"},
+    ]
+    answer = "100.00亿元[c1]"
+    fixed = repair_citations(answer, chunks, question="甲公司2025年的营业收入是多少？")
+    assert "[c2]" in fixed
+    passed, _ratio, _verdicts = verify_answer(fixed, chunks)
+    assert passed
+
+
+def test_裸数字修复仍受问题年份约束():
+    """Q3 + Q4：问题问 2025，候选块是 2021，不许修。"""
+    from app.rag.verify import repair_citations, verify_answer
+
+    chunks = [
+        {"citation_id": "c1", "source": "新能源-000-甲公司-2025", "text": "甲公司2025年经营正常。"},
+        {"citation_id": "c2", "source": "新能源-000-甲公司-2021", "text": "甲公司2021年营业收入100.00亿元。"},
+    ]
+    answer = "100.00亿元[c1]"
+    fixed = repair_citations(answer, chunks, question="甲公司2025年的营业收入是多少？")
+    assert "[c2]" not in fixed
+    passed, _ratio, _verdicts = verify_answer(fixed, chunks)
+    assert not passed

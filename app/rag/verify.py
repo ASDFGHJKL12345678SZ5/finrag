@@ -78,7 +78,7 @@ def split_claims(answer: str) -> list[tuple[str, str]]:
     claims: list[tuple[str, str]] = []
     for sentence in re.split(r"[。；;\n]", normalized):
         sentence = re.sub(
-            r"(^|[：:，,；;])\s*\d+[.、)）]\s*", r"\1", sentence.strip(),
+            r"(^|[：:，,；;])\s*\d+[.、)）](?!\d)\s*", r"\1", sentence.strip(),
         )
         # 先摘引用标记再查数字——[c1] 里的 1 不是数据，
         # 顺序反了会让每个带引用的句子都被当成数字论断
@@ -143,18 +143,22 @@ def _metric_terms_in(claim: str) -> list[str]:
 
 
 def repair_citations(
-    answer: str, chunks: list[dict], entities: set[str] | None = None
+    answer: str,
+    chunks: list[dict],
+    entities: set[str] | None = None,
+    question: str = "",
 ) -> str:
-    """把"引用错块"的论断自动改引到真正含该数字的块（FR-10 / RW-5）。
+    """把"引用错块"的论断自动改引到真正含该数字的块（FR-10 / RW-5 / Q3）。
 
-    RW-5 收紧：候选块必须同时满足
-    1. 属于论断/答案里提到的公司（source 解析出的简称在 entities 里）；
-    2. 含论断里的指标词（METRIC_GROUPS 说法）；
-    3. **与论断同年/同源**（Q4）：论断含年份时，候选 source 的年份必须一致；
-       论断不含年份时，只允许改引到被引块同一篇 source（同源），
-       否则不修。
-    这样避免"数字碰巧相同但公司不同"或"同公司另一年"的块被拿来修复、
-    再自证忠实度。找不到就原样返回，绝不为了过校验放宽判据。
+    候选块约束：
+    1. 属于论断/答案里提到的公司；论断是裸数字（"670.91亿元[c1]"）时，
+       用**问题里的公司**兜底；
+    2. 含论断里的指标词；裸数字时用**问题里的指标**兜底；
+    3. 与论断同年/同源（Q4）：论断含年份用论断年份；否则用问题年份；
+       两者都没有时只允许改引到被引块同一篇 source。
+    这样既不让"数字碰巧相同但公司/年份不同"的块自证，也能把 Q3 的
+    "答案正确但引用落点错"的裸数字改到问题对应的块。
+    找不到就原样返回，绝不为了过校验放宽数字匹配。
     """
     if not answer or not chunks:
         return answer
@@ -167,6 +171,15 @@ def repair_citations(
         answer,
     )
     entities = entities or set()
+    question = question or ""
+    question_years = set(re.findall(r"(?:19|20)\d{2}", question))
+    question_metrics = _metric_terms_in(question)
+    chunk_companies = {
+        company for c in chunks
+        if (company := _source_company(c)) is not None
+    }
+    question_entities = {company for company in chunk_companies if company in question}
+    allowed_entities = entities or question_entities
     by_id = {c.get("citation_id"): c for c in chunks if c.get("citation_id")}
     parts = re.split(r"(?<=[。；;\n])", answer)
     repaired: list[str] = []
@@ -183,20 +196,27 @@ def repair_citations(
             repaired.append(segment)
             continue
         claim_year = _claim_year(claim)
+        target_year = claim_year or (
+            next(iter(question_years)) if len(question_years) == 1 else None
+        )
         cited_sources = {
             by_id[c].get("source") for c in cited if c in by_id
         }
-        metric_terms = _metric_terms_in(claim)
+        metric_terms = _metric_terms_in(claim) or question_metrics
         candidate = next(
             (
                 c for c in chunks
                 if c.get("citation_id") not in cited
-                and (not entities or _source_company(c) in entities)
+                and (not allowed_entities or _source_company(c) in allowed_entities)
                 and (not metric_terms or any(t in c["text"] for t in metric_terms))
                 and (
-                    _source_year(c) == claim_year
-                    if claim_year
-                    else (c.get("source") in cited_sources)
+                    _source_year(c) == target_year
+                    if target_year
+                    else (
+                        _source_year(c) in question_years
+                        if question_years
+                        else c.get("source") in cited_sources
+                    )
                 )
                 and not _missing_evidence(claim, c["text"])
             ),
@@ -285,7 +305,9 @@ def _missing_evidence(claim: str, evidence: str) -> list[str]:
             missing.append(raw)
     bigrams = _content_bigrams(claim)
     hits = sum(1 for g in bigrams if g in evidence)
-    if bigrams and hits < 2:
+    # 短论断（“670.91亿元”：只有“亿元”一个内容词）不能按 2 个二元组要求，
+    # 否则答案数字完全正确也会被判无据；数字硬门禁仍是主要依据。
+    if bigrams and hits < min(2, len(bigrams)):
         missing.append(f"内容词命中不足({hits}/{len(bigrams)})")
     return missing
 

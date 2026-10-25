@@ -238,7 +238,9 @@ async def verify(state: RAGState) -> dict:
         if c.get("source") and c["source"].count("-") >= 2
     }
     entities = {company for company in companies if company in raw_answer}
-    answer = repair_citations(raw_answer, chunks, entities=entities)
+    answer = repair_citations(
+        raw_answer, chunks, entities=entities, question=state.get("question", "")
+    )
     _pre_passed, pre_ratio, _pre_verdicts = verify_answer(raw_answer, chunks)
     passed, ratio, verdicts = verify_answer(answer, chunks)
     # Q3：模型“嘴上拒答”（首/末句宣称无法确定且无数字）时，终态也必须是
@@ -320,7 +322,16 @@ def rewrite_query(state: RAGState) -> dict:
 
 def _build_prompt(question: str, chunks: list[dict]) -> str:
     """构造带引用的生成 prompt。证据区用 [cN] 编号，与答案引用约定一致。"""
-    lines = [f"问题：{question}", "", "证据（回答必须引用编号，禁止使用证据之外的数字）："]
+    lines = [
+        f"问题：{question}",
+        "",
+        (
+            "回答要求：先复述公司、年份和指标，再给数字与 [cN] 引用；"
+            "不要只回一个数字。"
+        ),
+        "",
+        "证据（回答必须引用编号，禁止使用证据之外的数字）：",
+    ]
     for c in chunks:
         lines.append(f"[{c['citation_id']}] {c['source']} / {c['section_path']}")
         lines.append(c["text"])
