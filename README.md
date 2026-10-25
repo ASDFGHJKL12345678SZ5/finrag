@@ -413,6 +413,11 @@ share 14/20）→ FR-10 跨文档聚合 + FR-11 引用修复/指标词典补"收
 FR-10/FR-11 的设计见 [`reports/fr10_aggregate.md`](reports/fr10_aggregate.md)、
 [`reports/fr11_citation_repair.md`](reports/fr11_citation_repair.md)。
 
+**抽取能力的适用边界（R3）**：聚合事实由 `app/rag/fact_extract.py` 从正文与
+Markdown 表格正则抽取（RW-1 后不再读 ground truth）。抽取 **P/R 1.000 是模板
+语料上的成绩**：正文正则绑死“实现营业收入 X 亿元”句式，表格正则只认
+“亿元 + 百分比”两列——换语料/换版式需重标定，不代表通用 PDF/HTML 抽取能力。
+
 **迭代期 200 题样本（分层打散，FR-10/11 之前跑的）**：
 exact/abbr 100%、calculation 77.3%、refusal 100%；overall 95.0%，原因是
 样本里 calculation 占 1/3（全量只占 14.3%），不是系统退化。该样本不包含
