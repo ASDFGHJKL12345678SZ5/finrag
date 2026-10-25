@@ -11,9 +11,20 @@
 """
 from __future__ import annotations
 
+import json
 import random
+from collections import defaultdict
+from functools import lru_cache
+from pathlib import Path
 
-from app.rag.corpus import BenchQuestion, Report, all_facts
+from app.rag.corpus import (
+    BenchQuestion,
+    Report,
+    all_facts,
+    build_companies,
+    build_corpus,
+)
+from app.rag.metric_lexicon import is_future_question, unsupported_terms_in
 
 HOLDOUT_CORPUS_SEED = 20261026
 
@@ -151,4 +162,314 @@ def build_holdout(reports: list[Report]) -> list[BenchQuestion]:
             expected="refuse", subtype="extra_metric",
         ))
 
+    return questions
+
+
+# ================================================================ 留出集 v2（R2）
+#
+# 出题人：独立隔离会话。它只拿到 `corpus_format.md`（语料字段格式）与
+# `assignment.md`（200 题规格），没有 v1 题目、失败明细或实现代码。
+# 它会话产出的模板/候选清单逐字落在 `holdout_v2_spec.json`（本文件不改写题面），
+# 这里只做实例化与机械选择：
+# - exact 80 / abbr 60：只用 v1 未出现过的 4 字简称与 3 字缩写（v1 用过的名字
+#   由确定性重建 v1 题库得到，不手写清单）；
+# - calculation 20：8 yoy + 6 segment_share + 6 industry_max；industry_max
+#   不带“行业”二字，用来验证 R1 的元数据驱动识别；
+# - refusal 40：20 指标 + 10 未来 + 10 错年份。20 个指标从作者给的 30 个候选里
+#   机械分成“当前守卫抓不到”（形态外）与“抓得到”（对照组），前者放进 v2 测边界。
+#
+# 语料种子 20261111（训练 20260929 / v1 20261026），数字全变。
+
+HOLDOUT_V2_CORPUS_SEED = 20261111
+_V2_SPEC_PATH = Path(__file__).with_name("holdout_v2_spec.json")
+# 训练集与 v1 用过的错年份：v2 尽量避开，换 2009/2011/2013–2017/2028–2030
+_V2_YEAR_EXCLUDE = frozenset({2018, 2019, 2020, 2026, 2027})
+
+
+@lru_cache(maxsize=1)
+def _v2_spec() -> dict:
+    return json.loads(_V2_SPEC_PATH.read_text(encoding="utf-8"))
+
+
+@lru_cache(maxsize=1)
+def v1_used_names() -> tuple[frozenset[str], frozenset[str]]:
+    """v1 用过的 4 字简称 / 3 字缩写（确定性重建 v1 题库，不手写清单）。"""
+    v1 = build_holdout(build_corpus(seed=HOLDOUT_CORPUS_SEED))
+    by_short = {c.short: c for c in build_companies()}
+    shorts = {
+        q.source.split("-")[2]
+        for q in v1
+        if q.source and q.source.count("-") >= 2
+    }
+    abbrs = {
+        by_short[q.source.split("-")[2]].abbr
+        for q in v1
+        if q.category == "abbr" and q.source and q.source.count("-") >= 2
+    }
+    return frozenset(shorts), frozenset(abbrs)
+
+
+def _usable_templates(templates: list[str], required: tuple[str, ...]) -> list[str]:
+    out = [t for t in templates if all("{" + p + "}" in t for p in required)]
+    if not out:
+        raise ValueError(f"没有可用模板（需要占位符 {required}）：{templates}")
+    return out
+
+
+def _split_even(total: int, parts: int) -> list[int]:
+    base, rem = divmod(total, parts)
+    return [base + (1 if i < rem else 0) for i in range(parts)]
+
+
+def _one_per_company(facts, by_source, rng):
+    """每个公司只留一条事实再打散（exact/abbr 用，避免同一简称重复）。"""
+    by_company: dict[str, list] = defaultdict(list)
+    for fact in sorted(facts, key=lambda f: f.fact_id):
+        by_company[by_source[fact.source].company.short].append(fact)
+    picks = [(rng.choice(items), by_source[items[0].source])
+             for items in by_company.values()]
+    rng.shuffle(picks)
+    return picks
+
+
+def _one_per_source(facts, rng):
+    """每篇研报只留一条事实再打散（yoy/share 用，避免同一文档重复）。"""
+    by_source: dict[str, list] = defaultdict(list)
+    for fact in sorted(facts, key=lambda f: f.fact_id):
+        by_source[fact.source].append(fact)
+    picks = [rng.choice(items) for items in by_source.values()]
+    rng.shuffle(picks)
+    return picks
+
+
+def _select_refusal_metrics(metrics: list[str]) -> tuple[list[str], list[str]]:
+    """把作者的 30 个候选机械分成“守卫抓不到 / 抓得到”，各取一部分。"""
+
+    def guard_catches(metric: str) -> bool:
+        return bool(unsupported_terms_in(f"某公司2024年的{metric}是多少？"))
+
+    boundary = [m for m in metrics if not guard_catches(m)]
+    shaped = [m for m in metrics if guard_catches(m)]
+    picked = boundary[:10]
+    picked += shaped[: 20 - len(picked)]
+    if len(picked) < 20:
+        picked += [m for m in metrics if m not in picked][: 20 - len(picked)]
+    return picked[:20], boundary
+
+
+def _select_future_phrases(phrases: list[str]) -> tuple[list[str], list[str]]:
+    escaped = [p for p in phrases if not is_future_question(p)]
+    marked = [p for p in phrases if is_future_question(p)]
+    picked = escaped[:5]
+    picked += marked[: 10 - len(picked)]
+    if len(picked) < 10:
+        picked += [p for p in phrases if p not in picked][: 10 - len(picked)]
+    return picked[:10], escaped
+
+
+def build_holdout_v2(reports: list[Report]) -> list[BenchQuestion]:
+    """R2 留出集 v2：200 题 = exact 80 / abbr 60 / calculation 20 / refusal 40。"""
+    spec = _v2_spec()
+    rng = random.Random("holdout-finrag-v2")
+    v1_shorts, v1_abbrs = v1_used_names()
+    indexed = [r for r in reports if r.company is not None]
+    by_source = {r.source: r for r in indexed}
+    body = [f for f in all_facts(reports) if not f.table_only and f.source in by_source]
+    fresh = [f for f in body if by_source[f.source].company.short not in v1_shorts]
+    questions: list[BenchQuestion] = []
+
+    # ---- exact 80：新简称 + 作者的指标说法 + 作者模板 ----
+    metrics = list(spec["exact"]["metric_labels"])
+    exact_templates = _usable_templates(
+        spec["exact"]["templates"], ("short", "year", "metric")
+    )
+    for i, (metric, k) in enumerate(
+        zip(metrics, _split_even(80, len(metrics)), strict=True)
+    ):
+        picks = _one_per_company(
+            [f for f in fresh if f.metric == metric], by_source, rng
+        )[:k]
+        if len(picks) < k:
+            raise ValueError(f"exact 公司不足：{metric} 需要 {k}，只有 {len(picks)}")
+        labels = spec["exact"]["metric_labels"][metric]
+        for j, (fact, report) in enumerate(picks):
+            label = labels[j % len(labels)]
+            template = exact_templates[(i + j) % len(exact_templates)]
+            questions.append(BenchQuestion(
+                qid=f"v2-exact-{len(questions):04d}", category="exact",
+                question=template.format(
+                    short=report.company.short,  # type: ignore[union-attr]
+                    year=report.year, metric=label,
+                ),
+                source=fact.source, answer=fact.answer,
+                evidence_terms=list(fact.evidence_terms), expected="answer",
+                subtype=metric,
+            ))
+
+    # ---- abbr 60：v1 未用过的 3 字缩写，每指标 10 题 ----
+    labels_by_metric = spec["abbr"]["metric_labels"]
+    templates = _usable_templates(
+        spec["abbr"]["templates"], ("abbr", "year", "metric")
+    )
+    used_abbrs: set[str] = set()
+    for i, metric in enumerate(metrics):
+        picked = []
+        for fact, report in _one_per_company(
+            [f for f in fresh if f.metric == metric], by_source, rng
+        ):
+            abbr = report.company.abbr  # type: ignore[union-attr]
+            if abbr in v1_abbrs or abbr in used_abbrs:
+                continue
+            used_abbrs.add(abbr)
+            picked.append((fact, report))
+            if len(picked) == 10:
+                break
+        if len(picked) < 10:
+            raise ValueError(f"abbr 新缩写不足：{metric} 只有 {len(picked)}")
+        labels = labels_by_metric[metric]
+        for j, (fact, report) in enumerate(picked):
+            label = labels[j % len(labels)]
+            template = templates[(i + j) % len(templates)]
+            questions.append(BenchQuestion(
+                qid=f"v2-abbr-{len(questions):04d}", category="abbr",
+                question=template.format(
+                    abbr=report.company.abbr,  # type: ignore[union-attr]
+                    year=report.year, metric=label,
+                ),
+                source=fact.source, answer=fact.answer,
+                evidence_terms=list(fact.evidence_terms), expected="answer",
+                subtype="abbr",
+            ))
+
+    # ---- calculation 20：8 yoy + 6 share + 6 industry_max ----
+    yoy_templates = _usable_templates(
+        spec["calculation"]["yoy"]["templates"], ("short", "year")
+    )
+    yoy_picks = _one_per_source(
+        [f for f in fresh if f.metric == "同比增长"], rng
+    )[:8]
+    if len(yoy_picks) < 8:
+        raise ValueError(f"yoy 文档不足：{len(yoy_picks)}")
+    for j, fact in enumerate(yoy_picks):
+        report = by_source[fact.source]
+        questions.append(BenchQuestion(
+            qid=f"v2-calc-{len(questions):04d}", category="calculation",
+            question=yoy_templates[j % len(yoy_templates)].format(
+                short=report.company.short,  # type: ignore[union-attr]
+                year=report.year,
+            ),
+            source=fact.source, answer=fact.answer,
+            evidence_terms=list(fact.evidence_terms), expected="answer",
+            subtype="yoy",
+        ))
+
+    share_templates = _usable_templates(
+        spec["calculation"]["segment_share"]["templates"],
+        ("short", "year", "segment"),
+    )
+    share_pool = [
+        f for f in all_facts(reports)
+        if f.table_only and f.source in by_source
+        and by_source[f.source].company.short not in v1_shorts
+    ]
+    share_picks = _one_per_source(share_pool, rng)[:6]
+    if len(share_picks) < 6:
+        raise ValueError(f"share 文档不足：{len(share_picks)}")
+    for j, fact in enumerate(share_picks):
+        report = by_source[fact.source]
+        answer = f"{fact.share:.2f}%"
+        questions.append(BenchQuestion(
+            qid=f"v2-calc-{len(questions):04d}", category="calculation",
+            question=share_templates[j % len(share_templates)].format(
+                short=report.company.short,  # type: ignore[union-attr]
+                year=report.year, segment=fact.segment,
+            ),
+            source=fact.source, answer=answer,
+            evidence_terms=[fact.segment, answer], expected="answer",
+            subtype="segment_share",
+        ))
+
+    industry_templates = _usable_templates(
+        spec["calculation"]["industry_max"]["templates"], ("industry", "year")
+    )
+    combos = sorted({(r.industry, r.year) for r in indexed})
+    valid_combos: list[tuple[str, int]] = []
+    for combo in combos:
+        candidates = [
+            r for r in indexed if r.industry == combo[0] and r.year == combo[1]
+        ]
+        top = max(r.revenue for r in candidates)
+        if sum(1 for r in candidates if r.revenue == top) == 1:
+            valid_combos.append(combo)
+    by_industry: dict[str, list] = defaultdict(list)
+    for combo in valid_combos:
+        by_industry[combo[0]].append(combo)
+    if len(by_industry) != 5:
+        raise ValueError(f"有效行业组合覆盖不足 5 个行业：{sorted(by_industry)}")
+    chosen: list[tuple[str, int]] = [
+        rng.choice(items) for _industry, items in sorted(by_industry.items())
+    ]
+    chosen += _pick(rng, [c for c in valid_combos if c not in chosen], 1)
+    for j, (industry, year) in enumerate(chosen[:6]):
+        candidates = [
+            r for r in indexed if r.industry == industry and r.year == year
+        ]
+        winner = max(candidates, key=lambda r: r.revenue)
+        assert winner.company is not None
+        questions.append(BenchQuestion(
+            qid=f"v2-calc-{len(questions):04d}", category="calculation",
+            question=industry_templates[j % len(industry_templates)].format(
+                industry=industry, year=year,
+            ),
+            source=winner.source, answer=winner.company.short,
+            evidence_terms=[
+                winner.company.short, "营业收入", f"{winner.revenue:.2f}亿元",
+            ],
+            expected="answer", subtype="industry_max",
+        ))
+    if sum(1 for q in questions if q.subtype == "industry_max") != 6:
+        raise ValueError("industry_max 组题数不足 6（有并列或数据不足）")
+
+    # ---- refusal 40：20 指标 + 10 未来 + 10 错年份 ----
+    refusal = spec["refusal"]
+    picked_metrics, boundary = _select_refusal_metrics(
+        list(refusal["unsupported_metrics"])
+    )
+    shorts = sorted({by_source[f.source].company.short for f in fresh})
+    for i, metric in enumerate(picked_metrics):
+        questions.append(BenchQuestion(
+            qid=f"v2-ref-{len(questions):04d}", category="refusal",
+            question=f"{shorts[i % len(shorts)]}{2021 + i % 5}年的{metric}是多少？",
+            source=None, answer=None, evidence_terms=[], expected="refuse",
+            subtype="boundary_metric" if metric in boundary else "shaped_metric",
+        ))
+
+    picked_future, escaped = _select_future_phrases(
+        list(refusal["future_phrases"])
+    )
+    for i, phrase in enumerate(picked_future):
+        questions.append(BenchQuestion(
+            qid=f"v2-ref-{len(questions):04d}", category="refusal",
+            question=f"{shorts[(i + 11) % len(shorts)]}{phrase}",
+            source=None, answer=None, evidence_terms=[], expected="refuse",
+            subtype="future_escaped" if phrase in escaped else "future_marked",
+        ))
+
+    wrong_years = [
+        int(y) for y in refusal["wrong_years"] if int(y) not in _V2_YEAR_EXCLUDE
+    ]
+    if len(wrong_years) < 10:
+        wrong_years = [int(y) for y in refusal["wrong_years"]]
+    for i, year in enumerate(wrong_years[:10]):
+        questions.append(BenchQuestion(
+            qid=f"v2-ref-{len(questions):04d}", category="refusal",
+            question=f"{shorts[(i + 23) % len(shorts)]}{year}年的总收入是多少？",
+            source=None, answer=None, evidence_terms=[], expected="refuse",
+            subtype="wrong_year",
+        ))
+
+    if len(questions) != 200:
+        raise ValueError(f"留出集 v2 题数 {len(questions)} != 200")
+    if len({q.question for q in questions}) != 200:
+        raise ValueError("留出集 v2 出现重复题面")
     return questions

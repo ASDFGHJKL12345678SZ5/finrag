@@ -29,7 +29,12 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.winloop import ensure_selector_loop
 from app.eval.db import ensure_eval_database
-from app.eval.holdout import HOLDOUT_CORPUS_SEED, build_holdout
+from app.eval.holdout import (
+    HOLDOUT_CORPUS_SEED,
+    HOLDOUT_V2_CORPUS_SEED,
+    build_holdout,
+    build_holdout_v2,
+)
 from app.eval.schema import EVAL_SCHEMA_SQL
 from app.rag import store
 from app.rag.corpus import build_benchmark, build_corpus
@@ -201,15 +206,21 @@ async def run_eval(
     limit: int = 0,
     end2end_limit: int = 0,
     timeout_s: float = 120.0,
-    holdout: bool = False,
+    holdout: int = 0,
 ) -> dict:
     settings = get_settings()
     t_seed = time.perf_counter()
-    corpus_seed = HOLDOUT_CORPUS_SEED if holdout else seed
+    corpus_seed = {
+        0: seed,
+        1: HOLDOUT_CORPUS_SEED,
+        2: HOLDOUT_V2_CORPUS_SEED,
+    }[holdout]
     reports, eval_db = await seed_eval_corpus(n_companies, years, corpus_seed)
     seed_s = time.perf_counter() - t_seed
     n_chunks, _avg_len = await store.corpus_stats()
-    if holdout:
+    if holdout == 2:
+        benchmark = build_holdout_v2(reports)
+    elif holdout == 1:
         benchmark = build_holdout(reports)
     else:
         benchmark = build_benchmark(
@@ -411,7 +422,7 @@ async def run_eval(
         "eval_database": eval_db,
         "mode": settings.embedding_mode,
         "llm_mode": settings.llm_mode,
-        "split": "holdout" if holdout else "train",
+        "split": "train" if not holdout else f"holdout_v{holdout}",
         "corpus_seed": corpus_seed,
         "n_companies": n_companies,
         "years": list(years),
@@ -521,8 +532,9 @@ def main() -> None:
     parser.add_argument("--end2end", type=int, default=0,
                         help="端到端最多跑多少道可答题（0=全跑）")
     parser.add_argument("--timeout", type=float, default=120.0)
-    parser.add_argument("--holdout", action="store_true",
-                        help="RW-2 留出集：换语料种子 20261026 + 新问句模板")
+    parser.add_argument("--holdout", type=int, nargs="?", const=1, default=0,
+                        choices=(0, 1, 2),
+                        help="留出集版本：--holdout/1=v1（20261026），2=v2（20261111）")
     args = parser.parse_args()
 
     years = tuple(int(y) for y in args.years.split(",") if y.strip())
