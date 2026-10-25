@@ -1,6 +1,6 @@
 # FinRAG 留出集 v2 金标执行记录（R2）
 
-- 题目：`app/eval/holdout.py` + `app/eval/holdout_v2_spec.json`（commit `bdef714`，早于本文件）
+- 题目：`app/eval/holdout.py` + `app/eval/holdout_v2_spec.json`（commit `e469e63`，早于本文件）
 - 出题：独立隔离会话（只给语料字段格式与题面规格）
 - 语料：1000 篇（seed=20261111）
 - 题数：200 = {'exact': 80, 'abbr': 60, 'calculation': 20, 'refusal': 40}
