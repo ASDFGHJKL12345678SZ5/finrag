@@ -15,15 +15,15 @@
   "rrf": {
    "abbr": {
     "n": 60,
-    "mrr": 0.6756,
-    "recall@5": 0.7167,
-    "evidence_hit": 0.6667
+    "mrr": 0.6611,
+    "recall@5": 0.7333,
+    "evidence_hit": 0.7
    },
    "exact": {
     "n": 80,
-    "mrr": 0.9698,
+    "mrr": 0.9219,
     "recall@5": 1.0,
-    "evidence_hit": 0.9625
+    "evidence_hit": 0.95
    },
    "refusal": {
     "n": 0,
@@ -33,23 +33,23 @@
    },
    "calculation": {
     "n": 20,
-    "mrr": 0.6417,
+    "mrr": 0.65,
     "recall@5": 0.7,
-    "evidence_hit": 0.5
+    "evidence_hit": 0.45
    }
   },
   "hybrid": {
    "abbr": {
     "n": 60,
-    "mrr": 0.7742,
-    "recall@5": 0.95,
-    "evidence_hit": 0.9167
+    "mrr": 0.8033,
+    "recall@5": 0.9833,
+    "evidence_hit": 0.95
    },
    "exact": {
     "n": 80,
-    "mrr": 0.9698,
+    "mrr": 0.9292,
     "recall@5": 1.0,
-    "evidence_hit": 0.9625
+    "evidence_hit": 0.95
    },
    "refusal": {
     "n": 0,
@@ -59,7 +59,7 @@
    },
    "calculation": {
     "n": 20,
-    "mrr": 0.635,
+    "mrr": 0.65,
     "recall@5": 0.7,
     "evidence_hit": 0.55
    }
@@ -67,15 +67,15 @@
   "vector_only": {
    "abbr": {
     "n": 60,
-    "mrr": 0.6403,
-    "recall@5": 0.7167,
-    "evidence_hit": 0.6667
+    "mrr": 0.6556,
+    "recall@5": 0.7333,
+    "evidence_hit": 0.7
    },
    "exact": {
     "n": 80,
-    "mrr": 0.7625,
-    "recall@5": 0.8375,
-    "evidence_hit": 0.8125
+    "mrr": 0.7498,
+    "recall@5": 0.8625,
+    "evidence_hit": 0.8375
    },
    "refusal": {
     "n": 0,
@@ -85,15 +85,15 @@
    },
    "calculation": {
     "n": 20,
-    "mrr": 0.375,
-    "recall@5": 0.4,
-    "evidence_hit": 0.3
+    "mrr": 0.525,
+    "recall@5": 0.55,
+    "evidence_hit": 0.35
    }
   },
   "keyword_only": {
    "abbr": {
     "n": 60,
-    "mrr": 0.8881,
+    "mrr": 0.8533,
     "recall@5": 0.95,
     "evidence_hit": 0.9333
    },
@@ -118,36 +118,36 @@
   }
  },
  "latency_ms": {
-  "p50": 559.3,
-  "p95": 1082.6
+  "p50": 700.8,
+  "p95": 1119.7
  },
  "corpus_seed": 20261111,
  "n_companies": 200,
  "n_questions": 200,
- "seed_time_s": 124.1,
- "evaluated_at": "2026-10-25T01:25:26.076141+00:00",
+ "seed_time_s": 117.5,
+ "evaluated_at": "2026-10-25T02:05:03.417017+00:00",
  "eval_database": "finrag_eval",
  "end2end_sample": 160,
  "answer_accuracy": {
-  "abbr": 0.7,
-  "exact": 0.5625,
-  "calculation": 0.65
+  "abbr": 0.9333,
+  "exact": 0.75,
+  "calculation": 0.8
  },
- "overall_accuracy": 0.675,
+ "overall_accuracy": 0.86,
  "refusal_accuracy": {
   "wrong_year": 1.0,
   "future_marked": 1.0,
   "shaped_metric": 1.0,
   "future_escaped": 1.0,
-  "boundary_metric": 0.2857
+  "boundary_metric": 1.0
  },
- "refusal_miss_rate": 0.125,
+ "refusal_miss_rate": 0.0,
  "guard_false_reject": {
-  "abbr": 0.2,
-  "exact": 0.4,
-  "calculation": 0.2
+  "abbr": 0.0,
+  "exact": 0.0,
+  "calculation": 0.0
  },
- "citation_repair_rate": 0.0688,
+ "citation_repair_rate": 0.0375,
  "retrieval_by_subtype": {
   "rrf": {
    "yoy": {
@@ -158,13 +158,13 @@
    },
    "abbr": {
     "n": 60,
-    "mrr": 0.6756,
-    "recall@5": 0.7167,
-    "evidence_hit": 0.6667
+    "mrr": 0.6611,
+    "recall@5": 0.7333,
+    "evidence_hit": 0.7
    },
    "毛利率": {
     "n": 13,
-    "mrr": 0.9487,
+    "mrr": 0.8205,
     "recall@5": 1.0,
     "evidence_hit": 1.0
    },
@@ -178,29 +178,29 @@
     "n": 14,
     "mrr": 0.9464,
     "recall@5": 1.0,
-    "evidence_hit": 0.8571
+    "evidence_hit": 0.7857
    },
    "营业收入": {
     "n": 14,
-    "mrr": 0.9643,
+    "mrr": 0.8929,
     "recall@5": 1.0,
     "evidence_hit": 0.9286
    },
    "segment_share": {
     "n": 6,
-    "mrr": 0.8889,
+    "mrr": 0.9167,
     "recall@5": 1.0,
-    "evidence_hit": 0.3333
+    "evidence_hit": 0.1667
    },
    "归母净利润": {
     "n": 13,
-    "mrr": 0.9615,
+    "mrr": 0.9103,
     "recall@5": 1.0,
     "evidence_hit": 1.0
    },
    "研发费用率": {
     "n": 13,
-    "mrr": 1.0,
+    "mrr": 0.9615,
     "recall@5": 1.0,
     "evidence_hit": 1.0
    },
@@ -214,19 +214,19 @@
   "hybrid": {
    "yoy": {
     "n": 8,
-    "mrr": 0.9,
+    "mrr": 0.9375,
     "recall@5": 1.0,
     "evidence_hit": 1.0
    },
    "abbr": {
     "n": 60,
-    "mrr": 0.7742,
-    "recall@5": 0.95,
-    "evidence_hit": 0.9167
+    "mrr": 0.8033,
+    "recall@5": 0.9833,
+    "evidence_hit": 0.95
    },
    "毛利率": {
     "n": 13,
-    "mrr": 0.9615,
+    "mrr": 0.8718,
     "recall@5": 1.0,
     "evidence_hit": 1.0
    },
@@ -240,11 +240,11 @@
     "n": 14,
     "mrr": 0.9464,
     "recall@5": 1.0,
-    "evidence_hit": 0.8571
+    "evidence_hit": 0.7857
    },
    "营业收入": {
     "n": 14,
-    "mrr": 0.9643,
+    "mrr": 0.8631,
     "recall@5": 1.0,
     "evidence_hit": 0.9286
    },
@@ -256,7 +256,7 @@
    },
    "归母净利润": {
     "n": 13,
-    "mrr": 0.9487,
+    "mrr": 0.8974,
     "recall@5": 1.0,
     "evidence_hit": 1.0
    },
@@ -276,21 +276,21 @@
   "vector_only": {
    "yoy": {
     "n": 8,
-    "mrr": 0.75,
-    "recall@5": 0.75,
-    "evidence_hit": 0.75
+    "mrr": 0.875,
+    "recall@5": 0.875,
+    "evidence_hit": 0.875
    },
    "abbr": {
     "n": 60,
-    "mrr": 0.6403,
-    "recall@5": 0.7167,
-    "evidence_hit": 0.6667
+    "mrr": 0.6556,
+    "recall@5": 0.7333,
+    "evidence_hit": 0.7
    },
    "毛利率": {
     "n": 13,
-    "mrr": 0.4615,
-    "recall@5": 0.6154,
-    "evidence_hit": 0.6154
+    "mrr": 0.5987,
+    "recall@5": 0.9231,
+    "evidence_hit": 0.9231
    },
    "industry_max": {
     "n": 6,
@@ -306,27 +306,27 @@
    },
    "营业收入": {
     "n": 14,
-    "mrr": 0.9286,
-    "recall@5": 1.0,
-    "evidence_hit": 0.9286
+    "mrr": 0.7857,
+    "recall@5": 0.8571,
+    "evidence_hit": 0.7857
    },
    "segment_share": {
     "n": 6,
-    "mrr": 0.25,
-    "recall@5": 0.3333,
+    "mrr": 0.5833,
+    "recall@5": 0.6667,
     "evidence_hit": 0.0
    },
    "归母净利润": {
     "n": 13,
-    "mrr": 0.5962,
-    "recall@5": 0.6923,
-    "evidence_hit": 0.6923
+    "mrr": 0.6885,
+    "recall@5": 0.8462,
+    "evidence_hit": 0.8462
    },
    "研发费用率": {
     "n": 13,
-    "mrr": 0.8077,
-    "recall@5": 0.8462,
-    "evidence_hit": 0.8462
+    "mrr": 0.6538,
+    "recall@5": 0.6923,
+    "evidence_hit": 0.6923
    },
    "经营性现金流": {
     "n": 13,
@@ -344,7 +344,7 @@
    },
    "abbr": {
     "n": 60,
-    "mrr": 0.8881,
+    "mrr": 0.8533,
     "recall@5": 0.95,
     "evidence_hit": 0.9333
    },
@@ -398,7 +398,7 @@
    }
   }
  },
- "citation_faithfulness": 0.8819,
- "answer_accuracy_overall": 0.625,
- "citation_faithfulness_before": 0.9323
+ "citation_faithfulness": 0.8249,
+ "answer_accuracy_overall": 0.825,
+ "citation_faithfulness_before": 0.8504
 }
