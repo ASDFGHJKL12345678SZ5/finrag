@@ -266,6 +266,27 @@ def test_短数字论断有引用可通过():
     assert passed and all(v.supported for v in verdicts)
 
 
+def test_只有年份的复述句不算数据论断():
+    """RW-1：abbr 答案的“你要查的是 2022 年的指标”不是数据 claim。"""
+    assert split_claims("你要查的是该公司2022年的全年收入（营业收入）指标。") == []
+    assert split_claims("2022年营业收入982.68亿元。[c1]") == [
+        ("2022年营业收入982.68亿元", "c1")
+    ]
+
+
+def test_年份复述句不再误杀数字句():
+    """RW-1：数字句有引用时，前面的年份复述句不应导致整篇 insufficient。"""
+    from app.rag.verify import verify_answer
+
+    chunks = [_chunk("c1", "春山饮料2022年实现营业收入982.68亿元。")]
+    answer = (
+        "你要查的是该公司2022年的全年收入（营业收入）指标。"
+        "根据证据，春山饮料2022年实现营业收入982.68亿元。[c1]"
+    )
+    passed, _ratio, verdicts = verify_answer(answer, chunks)
+    assert passed and all(v.supported for v in verdicts)
+
+
 def test_裸数字按问题上下文修复引用():
     """Q3：只回“100.00亿元[c1]”时，按问题里的公司/年份/指标找到正确块。"""
     from app.rag.verify import repair_citations, verify_answer

@@ -54,15 +54,31 @@ class ClaimVerdict:
     missing: list[str]  # 缺失的证据词
 
 
+_YEAR_OR_DATE_RE = re.compile(
+    r"(?:19|20)\d{2}\s*年|(?:19|20)\d{2}[-/.]\d{1,2}[-/.]\d{1,2}"
+)
+
+
+def _has_data_number(text: str) -> bool:
+    """去掉年份/日期后还有没有数据数字。
+
+    “你要查的是 2022 年的收入指标”只有一个年份，不是数据论断；早期版把它
+    当数字 claim，因无引用而整篇误杀（v2 abbr 5 题）。真正的数据句
+    “2022 年营收 982.68 亿元”去掉年份后仍有 982.68，照常校验。
+    """
+    return bool(_NUM.search(_YEAR_OR_DATE_RE.sub("", text)))
+
+
 def split_claims(answer: str) -> list[tuple[str, str]]:
     """把答案拆成 (论断, 引用编号) 对。
 
-    两步预处理（缺一步引用校验就形同虚设）：
+    三步预处理（缺一步引用校验就形同虚设）：
     1. 引用归属：LLM 习惯把引用放在句子末尾（"……56.4%。[c1]"），而按
        句号切会把 [c1] 切到下一段开头——claim 和它的引用被拆开，校验
        必然误杀。先把句末的 [cN] 挪到句首，让引用跟着它修饰的句子走。
     2. 去列表序号："1. 宁德润能……" 里的 "1" 是序号不是数据，不剥掉
        会被当成数字论断，还常因无引用而误杀整篇答案。
+    3. 只有年份/日期的复述句不算数据论断（"你要查的是 2022 年的收入指标"）。
 
     一句话里可以有多个引用（"营收 X。[c1][c2]"）：按出现顺序去重后用
     "+" 连接。
@@ -85,7 +101,7 @@ def split_claims(answer: str) -> list[tuple[str, str]]:
         citations = list(dict.fromkeys(re.findall(r"\[c(\d+)\]", sentence)))
         citation_id = "+".join(f"c{n}" for n in citations)
         sentence = re.sub(r"\[c\d+\]\s*", "", sentence)
-        if not sentence or not _NUM.search(sentence):
+        if not sentence or not _has_data_number(sentence):
             continue
         claims.append((sentence, citation_id))
     return claims
