@@ -22,8 +22,8 @@
 ## 当前门禁
 
 - `ruff check app tests scripts` 全绿
-- `pytest tests/ -q`：**190 passed**
-- 真实 800 题（RW-5 后）：**797/800 = 99.6%**（见 `reports/real_eval_800_rw5.md`）；留出集 v2 **172/200 = 86.0%**（`reports/holdout_v2.md`；v1 168/200=84.0% 为 RW-3 前代码，仅存档）
+- `pytest tests/ -q`：**196 passed**
+- 真实 800 题（当前代码）：**800/800 = 100.0%**（RW-5 时 797/800=99.6%，见 `reports/real_eval_800_rw5.md`）；留出集 v2 **185/200 = 92.5%**（`reports/holdout_v2.md`；v1 168/200=84.0% 为 RW-3 前代码，仅存档）
 - 两仓库 `git status` clean
 
 ## 已知边界（不藏）
