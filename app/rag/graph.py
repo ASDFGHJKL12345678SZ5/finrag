@@ -44,7 +44,11 @@ from app.rag.aggregate import (
 from app.rag.llm import get_llm
 from app.rag.retrieve import hybrid_search
 from app.rag.sufficiency import check_sufficiency
-from app.rag.verify import repair_citations, verify_answer
+from app.rag.verify import (
+    is_declining_answer,
+    repair_citations,
+    verify_answer,
+)
 
 log = get_logger("graph")
 
@@ -237,28 +241,38 @@ async def verify(state: RAGState) -> dict:
     answer = repair_citations(raw_answer, chunks, entities=entities)
     _pre_passed, pre_ratio, _pre_verdicts = verify_answer(raw_answer, chunks)
     passed, ratio, verdicts = verify_answer(answer, chunks)
+    # Q3：模型“嘴上拒答”（首/末句宣称无法确定且无数字）时，终态也必须是
+    # insufficient。v2 边界指标实测 5/7 题文本拒答但 status=done——校验只看
+    # “有没有编数字”，没把明确说不知道当成拒答。
+    declined = is_declining_answer(answer)
+    if declined:
+        passed = False
     verdict_dicts = [
         {"claim": v.claim, "citation_id": v.citation_id,
          "supported": v.supported, "missing": v.missing}
         for v in verdicts
     ]
     status = "done" if passed else "insufficient"
+    refusal_reason = "model_declined" if declined else state.get("refusal_reason")
     log.info(
         "graph.verify",
         extra={"context": {
             "passed": passed, "ratio": round(ratio, 3), "claims": len(verdict_dicts),
+            "declined": declined,
         }},
     )
     return {
         "answer": answer,
         "verdicts": verdict_dicts,
         "status": status,
+        "refusal_reason": refusal_reason,
         "trace": [_step(
             "verify", started,
             passed=passed, ratio=round(ratio, 3), claims=len(verdict_dicts),
             pre_ratio=round(pre_ratio, 3),
             citation_repaired=answer != raw_answer,
             repair_entities=sorted(entities),
+            declined=declined,
         )],
     }
 

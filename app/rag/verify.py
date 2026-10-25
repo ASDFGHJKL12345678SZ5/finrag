@@ -97,6 +97,43 @@ def _source_company(chunk: dict) -> str | None:
     return parts[2] if len(parts) >= 3 else None
 
 
+def _source_year(chunk: dict) -> str | None:
+    """source 形如 `{industry}-{idx}-{company}-{year}`，取末尾年份。"""
+    parts = (chunk.get("source") or "").split("-")
+    tail = parts[-1] if parts else ""
+    return tail if len(tail) == 4 and tail.isdigit() else None
+
+
+def _claim_year(claim: str) -> str | None:
+    match = re.search(r"(20\d{2})\s*年", claim)
+    return match.group(1) if match else None
+
+
+# 拒答话术：模型“说不知道”但没给数时，把它当成 insufficient 终态（Q3）。
+_DECLINE_RE = re.compile(
+    r"无法确定|无法回答|无法提供|无法给出|无法计算|无法获取|不能确定"
+    r"|未披露|未提供|未提及|没有(?:相关)?数据"
+)
+
+
+def is_declining_answer(answer: str) -> bool:
+    """答案是否在宣称拒答且该句没有数字（Q3）。
+
+    v2 边界指标实测：模型写“无法确定自由现金流是多少”，终态却是 done——
+    校验只看“有没有编数字”，没有把“明确说不知道”当成拒答。判据是确定的：
+    只看首句/末句（拒答通常出现在开头或收尾），且该句不能含数字；中间
+    句子的免责声明不触发，避免把正常答案降级。
+    """
+    clean = re.sub(r"\[c\d+\]", "", answer or "")
+    # 年份不是“答案数字”：去掉 2023年 这类年份后再判断“有没有给数”
+    clean = re.sub(r"(?:19|20)\d{2}\s*年", "", clean)
+    sentences = [s.strip() for s in re.split(r"[。；;\n]", clean) if s.strip()]
+    if not sentences:
+        return False
+    probes = sentences if len(sentences) == 1 else [sentences[0], sentences[-1]]
+    return any(_DECLINE_RE.search(s) and not _NUM.search(s) for s in probes)
+
+
 def _metric_terms_in(claim: str) -> list[str]:
     return [s for group in METRIC_GROUPS.values() for s in group if s in claim]
 
@@ -108,16 +145,28 @@ def repair_citations(
 
     RW-5 收紧：候选块必须同时满足
     1. 属于论断/答案里提到的公司（source 解析出的简称在 entities 里）；
-    2. 含论断里的指标词（METRIC_GROUPS 说法）。
-    这样避免"数字碰巧相同但公司不同"的块被拿来修复、再自证忠实度。
-    找不到就原样返回，绝不为了过校验放宽判据。
+    2. 含论断里的指标词（METRIC_GROUPS 说法）；
+    3. **与论断同年/同源**（Q4）：论断含年份时，候选 source 的年份必须一致；
+       论断不含年份时，只允许改引到被引块同一篇 source（同源），
+       否则不修。
+    这样避免"数字碰巧相同但公司不同"或"同公司另一年"的块被拿来修复、
+    再自证忠实度。找不到就原样返回，绝不为了过校验放宽判据。
     """
     if not answer or not chunks:
         return answer
+    original_answer = answer
+    # 与 split_claims 同一套引用归属：先把句末 [cN] 挪回句首，
+    # 否则按句切分会把引用切到下一段，修复时拿不到“原引用/原 source”。
+    answer = re.sub(
+        r"([。；;!?！？])\s*((?:\[c\d+\]\s*)+)",
+        lambda m: m.group(2).strip() + m.group(1),
+        answer,
+    )
     entities = entities or set()
     by_id = {c.get("citation_id"): c for c in chunks if c.get("citation_id")}
     parts = re.split(r"(?<=[。；;\n])", answer)
     repaired: list[str] = []
+    repaired_flag = False
     for segment in parts:
         claims = split_claims(segment)
         if len(claims) != 1:
@@ -129,6 +178,10 @@ def repair_citations(
         if evidence and not _missing_evidence(claim, evidence):
             repaired.append(segment)
             continue
+        claim_year = _claim_year(claim)
+        cited_sources = {
+            by_id[c].get("source") for c in cited if c in by_id
+        }
         metric_terms = _metric_terms_in(claim)
         candidate = next(
             (
@@ -136,6 +189,11 @@ def repair_citations(
                 if c.get("citation_id") not in cited
                 and (not entities or _source_company(c) in entities)
                 and (not metric_terms or any(t in c["text"] for t in metric_terms))
+                and (
+                    _source_year(c) == claim_year
+                    if claim_year
+                    else (c.get("source") in cited_sources)
+                )
                 and not _missing_evidence(claim, c["text"])
             ),
             None,
@@ -144,7 +202,8 @@ def repair_citations(
             repaired.append(segment)
             continue
         repaired.append(f"[{candidate['citation_id']}]" + segment.lstrip())
-    return "".join(repaired)
+        repaired_flag = True
+    return "".join(repaired) if repaired_flag else original_answer
 
 
 def verify_answer(

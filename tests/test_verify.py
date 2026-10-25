@@ -165,3 +165,50 @@ def test_数字相同但公司不同不得用于修复():
     assert "[c2]" not in fixed
     passed, _ratio, _verdicts = verify_answer(fixed, chunks)
     assert not passed
+
+
+def test_同公司不同年份不得用于修复():
+    """Q4：断言 2025 年，候选块是 2021 年——同年约束不满足，不许修。"""
+    from app.rag.verify import repair_citations, verify_answer
+
+    chunks = [
+        {"citation_id": "c1", "source": "新能源-000-甲公司-2025", "text": "甲公司2025年经营正常。"},
+        {"citation_id": "c2", "source": "新能源-000-甲公司-2021", "text": "甲公司2021年营业收入100.00亿元。"},
+    ]
+    answer = "甲公司2025年营业收入100.00亿元。[c1]"
+    fixed = repair_citations(answer, chunks, entities={"甲公司"})
+    assert "[c2]" not in fixed
+    passed, _ratio, _verdicts = verify_answer(fixed, chunks)
+    assert not passed
+
+
+def test_宣称无法确定且无数字算拒答():
+    """Q3：首/末句宣称拒答且没有数字，应判为拒答话术。"""
+    from app.rag.verify import is_declining_answer
+
+    assert is_declining_answer("根据证据，无法确定中瀚新能2023年的自由现金流是多少。")
+    assert is_declining_answer("证据中未披露该指标的相关数据。")
+    # 有数字的句子不算“未给数字”——它是带证据的陈述
+    assert not is_declining_answer("无法确定自由现金流，但证据给出经营性现金流129.88亿元。")
+    assert not is_declining_answer("华曜新能2024年营业收入100.00亿元，同比增长5.00%。")
+
+
+def test_礼貌拒答终态判insufficient():
+    """Q3 图节点：文本拒答 + 无数字 -> status=insufficient/model_declined。"""
+    import asyncio
+
+    from app.rag.graph import verify
+
+    state = {
+        "question": "中瀚新能2023年的自由现金流是多少？",
+        "answer": "根据证据，无法确定中瀚新能2023年的自由现金流是多少。",
+        "retrieved": [{
+            "citation_id": "c1",
+            "source": "新能源-005-中瀚新能-2023",
+            "section_path": "现金流",
+            "text": "中瀚新能2023年经营性现金流净额为129.88亿元。",
+        }],
+    }
+    out = asyncio.run(verify(state))
+    assert out["status"] == "insufficient"
+    assert out["refusal_reason"] == "model_declined"
