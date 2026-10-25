@@ -24,7 +24,7 @@ from app.rag.corpus import (
     build_companies,
     build_corpus,
 )
-from app.rag.metric_lexicon import is_future_question, unsupported_terms_in
+from app.rag.metric_lexicon import is_future_question
 
 HOLDOUT_CORPUS_SEED = 20261026
 
@@ -248,19 +248,22 @@ def _one_per_source(facts, rng):
     return picks
 
 
+# 冻结的 refusal 指标集：v2 首跑（commit bc3f55c）实际使用的 20 题。
+# 为什么不再按当前守卫重算：Q2 修复后 `员工总数` 会从“形态内”变“形态外”，
+# 若运行时重新分类，代码一改测试集就跟着变——留出集必须冻结。
+_V2_REFUSAL_METRICS = (
+    "净利率", "资本开支", "自由现金流", "研发费用", "政府补助",
+    "汇兑损益", "在手订单",
+    "资产负债率", "净资产收益率", "每股收益", "每股净资产",
+    "销售费用率", "管理费用率", "财务费用率", "存货周转率",
+    "应收账款周转天数", "流动比率", "速动比率", "总资产", "净资产",
+)
+_V2_BOUNDARY_METRICS = frozenset(_V2_REFUSAL_METRICS[:7])
+
+
 def _select_refusal_metrics(metrics: list[str]) -> tuple[list[str], list[str]]:
-    """把作者的 30 个候选机械分成“守卫抓不到 / 抓得到”，各取一部分。"""
-
-    def guard_catches(metric: str) -> bool:
-        return bool(unsupported_terms_in(f"某公司2024年的{metric}是多少？"))
-
-    boundary = [m for m in metrics if not guard_catches(m)]
-    shaped = [m for m in metrics if guard_catches(m)]
-    picked = boundary[:10]
-    picked += shaped[: 20 - len(picked)]
-    if len(picked) < 20:
-        picked += [m for m in metrics if m not in picked][: 20 - len(picked)]
-    return picked[:20], boundary
+    """返回冻结的 refusal 指标顺序与“形态外”集合（参数仅为兼容旧调用）。"""
+    return list(_V2_REFUSAL_METRICS), list(_V2_BOUNDARY_METRICS)
 
 
 def _select_future_phrases(phrases: list[str]) -> tuple[list[str], list[str]]:

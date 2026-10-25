@@ -111,8 +111,9 @@ def _claim_year(claim: str) -> str | None:
 
 # 拒答话术：模型“说不知道”但没给数时，把它当成 insufficient 终态（Q3）。
 _DECLINE_RE = re.compile(
-    r"无法确定|无法回答|无法提供|无法给出|无法计算|无法获取|不能确定"
-    r"|未披露|未提供|未提及|没有(?:相关)?数据"
+    r"无法确定|无法回答|无法提供|无法给出|无法计算|无法获取|无法判断|无法仅凭"
+    r"|不能确定|未披露|未提供|未提及|未直接给出|未给出|没有直接给出|没有给出"
+    r"|没有(?:相关)?数据"
 )
 
 
@@ -121,17 +122,20 @@ def is_declining_answer(answer: str) -> bool:
 
     v2 边界指标实测：模型写“无法确定自由现金流是多少”，终态却是 done——
     校验只看“有没有编数字”，没有把“明确说不知道”当成拒答。判据是确定的：
-    只看首句/末句（拒答通常出现在开头或收尾），且该句不能含数字；中间
-    句子的免责声明不触发，避免把正常答案降级。
+    看**最后一个分句**（按句号/分号/换行/逗号切），含拒答词且该分句没有数字。
+    为什么用最后分句而不是整句：v2 的“研发费用”答案前半句给了研发费用率
+    10.92%，后半句才说“无法计算出确切金额”——整句有数字，但结论是拒答。
+    为什么不用整篇任意分句：正常答案的中间免责声明（“无法确定未来……”）
+    会把整篇降级；只认收尾结论。
     """
     clean = re.sub(r"\[c\d+\]", "", answer or "")
     # 年份不是“答案数字”：去掉 2023年 这类年份后再判断“有没有给数”
     clean = re.sub(r"(?:19|20)\d{2}\s*年", "", clean)
-    sentences = [s.strip() for s in re.split(r"[。；;\n]", clean) if s.strip()]
-    if not sentences:
+    clauses = [s.strip() for s in re.split(r"[。；;\n，,]", clean) if s.strip()]
+    if not clauses:
         return False
-    probes = sentences if len(sentences) == 1 else [sentences[0], sentences[-1]]
-    return any(_DECLINE_RE.search(s) and not _NUM.search(s) for s in probes)
+    last = clauses[-1]
+    return bool(_DECLINE_RE.search(last)) and not _NUM.search(last)
 
 
 def _metric_terms_in(claim: str) -> list[str]:

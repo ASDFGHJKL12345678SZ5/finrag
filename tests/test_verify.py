@@ -188,6 +188,9 @@ def test_宣称无法确定且无数字算拒答():
 
     assert is_declining_answer("根据证据，无法确定中瀚新能2023年的自由现金流是多少。")
     assert is_declining_answer("证据中未披露该指标的相关数据。")
+    assert is_declining_answer(
+        "但证据中未直接给出研发费用的具体金额，因此无法仅凭现有证据计算出确切数值。"
+    )
     # 有数字的句子不算“未给数字”——它是带证据的陈述
     assert not is_declining_answer("无法确定自由现金流，但证据给出经营性现金流129.88亿元。")
     assert not is_declining_answer("华曜新能2024年营业收入100.00亿元，同比增长5.00%。")
