@@ -222,12 +222,18 @@ def _split_even(total: int, parts: int) -> list[int]:
 
 
 def _one_per_company(facts, by_source, rng):
-    """每个公司只留一条事实再打散（exact/abbr 用，避免同一简称重复）。"""
+    """每个公司只留一条事实再打散（exact/abbr 用，避免同一简称重复）。
+
+    注意：返回的 report 必须是**该 fact 自己的**那篇研报（年份/答案同源）；
+    早期版误用了同公司第一条事实的 report，导致题面年份与金标年份错位。
+    """
     by_company: dict[str, list] = defaultdict(list)
     for fact in sorted(facts, key=lambda f: f.fact_id):
         by_company[by_source[fact.source].company.short].append(fact)
-    picks = [(rng.choice(items), by_source[items[0].source])
-             for items in by_company.values()]
+    picks = []
+    for items in by_company.values():
+        fact = rng.choice(items)
+        picks.append((fact, by_source[fact.source]))
     rng.shuffle(picks)
     return picks
 
@@ -472,4 +478,12 @@ def build_holdout_v2(reports: list[Report]) -> list[BenchQuestion]:
         raise ValueError(f"留出集 v2 题数 {len(questions)} != 200")
     if len({q.question for q in questions}) != 200:
         raise ValueError("留出集 v2 出现重复题面")
+    # 不变量：可答题的题面年份必须与源研报年份一致（题面/金标同源）
+    for q in questions:
+        if q.expected == "answer":
+            source_year = str(by_source[q.source].year)
+            if source_year not in q.question:
+                raise ValueError(
+                    f"{q.qid} 题面年份与源研报不一致：{q.question} -> {q.source}"
+                )
     return questions

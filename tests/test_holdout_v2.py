@@ -61,6 +61,14 @@ def test_行业极值不带行业二字且覆盖五个行业(bench):
     assert industries == {"新能源", "半导体", "医药生物", "食品饮料", "银行"}
 
 
+def test_可答题年份与源研报一致(bench):
+    by_source = {r.source: r for r in build_corpus(seed=HOLDOUT_V2_CORPUS_SEED)}
+    for q in bench:
+        if q.expected != "answer":
+            continue
+        assert str(by_source[q.source].year) in q.question, q.question
+
+
 def test_拒答档包含边界指标与边界未来措辞(bench):
     refusal = [q for q in bench if q.category == "refusal"]
     subtypes = Counter(q.subtype for q in refusal)
