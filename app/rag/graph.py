@@ -243,6 +243,12 @@ async def verify(state: RAGState) -> dict:
     )
     _pre_passed, pre_ratio, _pre_verdicts = verify_answer(raw_answer, chunks)
     passed, ratio, verdicts = verify_answer(answer, chunks)
+    repair_reverted = False
+    # Q4：修复不能让支持率变差；变差就回退原答案（仍无依据则保持拒答）。
+    if answer != raw_answer and ratio < pre_ratio:
+        answer = raw_answer
+        passed, ratio, verdicts = _pre_passed, pre_ratio, _pre_verdicts
+        repair_reverted = True
     # Q3：模型“嘴上拒答”（首/末句宣称无法确定且无数字）时，终态也必须是
     # insufficient。v2 边界指标实测 5/7 题文本拒答但 status=done——校验只看
     # “有没有编数字”，没把明确说不知道当成拒答。
@@ -273,6 +279,7 @@ async def verify(state: RAGState) -> dict:
             passed=passed, ratio=round(ratio, 3), claims=len(verdict_dicts),
             pre_ratio=round(pre_ratio, 3),
             citation_repaired=answer != raw_answer,
+            repair_reverted=repair_reverted,
             repair_entities=sorted(entities),
             declined=declined,
         )],
