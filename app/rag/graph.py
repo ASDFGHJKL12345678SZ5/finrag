@@ -246,7 +246,7 @@ async def verify(state: RAGState) -> dict:
     # Q3：模型“嘴上拒答”（首/末句宣称无法确定且无数字）时，终态也必须是
     # insufficient。v2 边界指标实测 5/7 题文本拒答但 status=done——校验只看
     # “有没有编数字”，没把明确说不知道当成拒答。
-    declined = is_declining_answer(answer)
+    declined = is_declining_answer(answer, question=state.get("question", ""))
     if declined:
         passed = False
     verdict_dicts = [

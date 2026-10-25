@@ -201,6 +201,36 @@ def test_宣称无法确定且无数字算拒答():
     assert not is_declining_answer("华曜新能2024年营业收入100.00亿元，同比增长5.00%。")
 
 
+def test_带免责声明的正确数字不算拒答():
+    """Q3：答案给了所问指标的数字、只补一句未提供其他项时，不能判拒答。"""
+    from app.rag.verify import is_declining_answer
+
+    assert not is_declining_answer(
+        "华曜新能2024年营业收入100.00亿元，但证据未提供净利润。",
+        question="华曜新能2024年的营业收入是多少？",
+    )
+    assert not is_declining_answer(
+        "恒润医疗2021年归母净利润为29.15亿元，未提供其他指标。",
+        question="恒润医疗2021年的归母净利润是多少？",
+    )
+
+
+def test_问题上下文区分拒答与相关指标数字():
+    """Q3：拒答答案里出现相关指标数字，仍应判拒答。"""
+    from app.rag.verify import is_declining_answer
+
+    assert is_declining_answer(
+        "中瀚新能2023年的自由现金流：证据中未提供该指标数据，"
+        "仅提供2023年经营性现金流净额129.88亿元。",
+        question="中瀚新能2023年的自由现金流是多少？",
+    )
+    assert is_declining_answer(
+        "中瀚动力2021年的净利率：根据证据，2021年营业收入988.09亿元、"
+        "归母净利润219.36亿元，但证据未直接给出净利率数值，无法计算。",
+        question="中瀚动力2021年的净利率是多少？",
+    )
+
+
 def test_礼貌拒答终态判insufficient():
     """Q3 图节点：文本拒答 + 无数字 -> status=insufficient/model_declined。"""
     import asyncio

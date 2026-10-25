@@ -117,14 +117,42 @@ _DECLINE_RE = re.compile(
 )
 
 
-def is_declining_answer(answer: str) -> bool:
+def _asked_metric_phrases(question: str) -> set[str]:
+    """问题里问的指标说法：注册词 + “X年的<短语>是多少”里的短语。"""
+    phrases = set(_metric_terms_in(question))
+    match = re.search(
+        r"(?:年|财年|季度)的([^，。？?]{2,24}?)(?:是多少|为多少|多大|怎么样|如何|是什么|$|[，。？?])",
+        question,
+    )
+    if match:
+        phrases.add(match.group(1).strip())
+    return {p for p in phrases if p}
+
+
+def _has_positive_metric_answer(answer: str, question: str) -> bool:
+    """答案里有没有“所问指标 + 数字”的正向陈述（用于区分拒答 vs 带免责的作答）。"""
+    for phrase in _asked_metric_phrases(question):
+        pattern = (
+            re.escape(phrase)
+            + r"\s*(?:（[^）]{0,8}）)?\s*"
+            + r"(?:为|是|达到|录得|约|实现|[:：])?\s*[-+]?\d"
+        )
+        if re.search(pattern, answer):
+            return True
+    return False
+
+
+def is_declining_answer(answer: str, question: str = "") -> bool:
     """答案是否在宣称拒答（Q3）。
 
     v2 边界指标实测：模型写“无法确定自由现金流是多少”，终态却是 done——
     校验只看“有没有编数字”，没有把“明确说不知道”当成拒答。v2 的拒答答案
     往往会先复述问题、再列一条**相关指标**的数字（“未提供自由现金流，仅提供
-    经营性现金流 129.88 亿元”），所以不能要求整句无数字；判据改为：
-    首句/末句含拒答词即算拒答（中间句子的免责声明不触发）。
+    经营性现金流 129.88 亿元”），所以不能要求整句无数字。
+
+    判据：首句/末句含拒答词，且答案里没有“所问指标 + 数字”的正向陈述。
+    正向陈述用问题里的指标说法（含同义词）判断，避免把“给了正确数字、只是
+    补了一句未提供其他项”的答案误判成拒答。
     """
     clean = re.sub(r"\[c\d+\]", "", answer or "")
     # 年份不是“答案数字”：去掉 2023年 这类年份后再切句
@@ -133,7 +161,9 @@ def is_declining_answer(answer: str) -> bool:
     if not sentences:
         return False
     probes = sentences if len(sentences) == 1 else [sentences[0], sentences[-1]]
-    return any(_DECLINE_RE.search(s) for s in probes)
+    if not any(_DECLINE_RE.search(s) for s in probes):
+        return False
+    return not (question and _has_positive_metric_answer(clean, question))
 
 
 def _metric_terms_in(claim: str) -> list[str]:
