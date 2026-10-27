@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from datetime import date
 
 import asyncpg
@@ -356,17 +357,22 @@ async def _decay_term_df(conn, chunk_ids: list[int]) -> None:
 
 
 async def _index_chunk_terms(conn, chunk_ids: list[int], chunks: list[Chunk]) -> None:
-    """把每块的词条（正文 + source 元数据）写入倒排索引并累加 df。"""
-    from collections import Counter
+    """把每块的词条（正文 + source 元数据）写入倒排索引并累加 df。
 
+    tf 必须是**真实词频**：先在保留重复的 token 流上 Counter，再去重/截断
+    生成写入词表。早期版先调用 `_extract_terms()`（已去重）再 Counter，
+    导致重复词永远只记 1，BM25 的 tf 饱和实际失效（见 test_入库tf写真实词频）。
+    """
     rows: list[tuple[int, str, int]] = []
     for cid, chunk in zip(chunk_ids, chunks, strict=True):
         # source 也进索引：财务块的正文只有指标、公司名只在 source 里
         # （旧 ILIKE 路同时查 text/source，这一条是它的等价物）
-        terms = _extract_terms(chunk.text, limit=64) + _extract_terms(
-            chunk.source, limit=16
-        )
-        for term, tf in Counter(terms).items():
+        merged: dict[str, int] = {}
+        for term, tf in _term_frequencies(chunk.text, limit=64):
+            merged[term] = merged.get(term, 0) + tf
+        for term, tf in _term_frequencies(chunk.source, limit=16):
+            merged[term] = merged.get(term, 0) + tf
+        for term, tf in merged.items():
             rows.append((cid, term, tf))
     if not rows:
         return
@@ -714,6 +720,34 @@ def boost_metric_terms(question: str, weights: dict[str, float]) -> dict[str, fl
         if any(term in m for m in hit_metrics):
             out[term] = w * METRIC_BOOST
     return out
+
+
+def _tokenize_terms(text: str) -> list[str]:
+    """把文本切成检索 token，**保留重复**，供入库统计真实 tf。
+
+    与 `_extract_terms()` 的切分规则一致（中文整串+二元组、英文数字整串），
+    但这里不做去重/截断——去重会丢掉词频，必须在 Counter 之后再做。
+    查询侧仍用 `_extract_terms()`，保持原有去重/截断行为不变。
+    """
+    terms: list[str] = []
+    for run in re.findall(r"[一-龥]+|[A-Za-z0-9]+", text):
+        if re.fullmatch(r"[A-Za-z0-9]+", run):
+            if len(run) >= 2:
+                terms.append(run)
+            continue
+        if len(run) <= 8:
+            terms.append(run)
+            if len(run) >= 2:
+                terms.extend(run[i : i + 2] for i in range(len(run) - 1))
+        else:
+            terms.extend(run[i : i + 2] for i in range(len(run) - 1))
+    return terms
+
+
+def _term_frequencies(text: str, limit: int) -> list[tuple[str, int]]:
+    """真实词频 + 唯一词表截断：先 Counter，再按首次出现顺序取前 limit。"""
+    counts = Counter(_tokenize_terms(text))
+    return [(term, counts[term]) for term in list(counts)[:limit]]
 
 
 def _extract_terms(query: str, limit: int = 12) -> list[str]:

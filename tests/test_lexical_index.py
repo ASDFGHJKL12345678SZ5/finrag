@@ -59,6 +59,37 @@ async def _seed_source(source: str = SOURCE, texts: list[str] | None = None) -> 
     await store.upsert_chunks(chunks, _vec(len(chunks)))
 
 
+def test_入库tf写真实词频():
+    """去重必须发生在 Counter 之后：重复词要写真实 tf，而不是恒为 1。"""
+
+    async def body():
+        await _seed_source(texts=["营业收入 营业收入 营业收入。"])
+        pool = store.get_pool()
+        async with pool.acquire() as conn:
+            chunk_id = await conn.fetchval(
+                "SELECT id FROM rag.chunks WHERE source = $1 AND chunk_index = 0",
+                SOURCE,
+            )
+            tf = await conn.fetchval(
+                "SELECT tf FROM rag.chunk_terms WHERE chunk_id = $1 AND term = $2",
+                chunk_id, "营业收入",
+            )
+            tf_bigram = await conn.fetchval(
+                "SELECT tf FROM rag.chunk_terms WHERE chunk_id = $1 AND term = $2",
+                chunk_id, "营业",
+            )
+        assert tf == 3, f"重复 3 次应写 tf=3，实际 {tf}"
+        assert tf_bigram == 3, f"二元组重复 3 次应写 tf=3，实际 {tf_bigram}"
+
+    _run(body)
+
+
+def test_查询侧词表仍去重():
+    """查询侧不参与本次修复：重复 query 词仍只保留一个。"""
+    terms = store._extract_terms("营业收入 营业收入", limit=12)
+    assert len(terms) == len(set(terms))
+
+
 def test_入库维护倒排索引与统计():
     async def body():
         await _seed_source()
