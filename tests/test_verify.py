@@ -364,3 +364,35 @@ def test_中文数字幻觉不再静默通过():
     passed, _ratio, verdicts = verify_answer(answer, chunks)
     assert not passed
     assert any("九亿九千万元" in v.missing for v in verdicts)
+
+
+def test_全角数字保留原文并归一():
+    """1:1 映射只用于解析，raw 必须保留全角原文，便于审计。"""
+    assert _parse_numbers("１２３．４５亿元") == [
+        ("１２３．４５亿元", 123.45e8, "money")
+    ]
+    assert _parse_numbers("１２．５％") == [("１２．５％", 12.5, "percent")]
+
+
+def test_中文口语省略():
+    """一万二=12000、一百二=120；有“零”时严格：一百零二=102。"""
+    assert _parse_numbers("一万二") == [("一万二", 12000.0, "bare")]
+    assert _parse_numbers("一百二") == [("一百二", 120.0, "bare")]
+    assert _parse_numbers("三千五") == [("三千五", 3500.0, "bare")]
+    assert _parse_numbers("三亿五") == [("三亿五", 3.5e8, "bare")]
+    assert _parse_numbers("一百零二") == [("一百零二", 102.0, "bare")]
+    assert _parse_numbers("一万零二") == [("一万零二", 10002.0, "bare")]
+
+
+def test_乘方科学计数法可解析且参与校验():
+    assert _parse_numbers("1.25×10^9元") == [
+        ("1.25×10^9元", 1.25e9, "money")
+    ]
+    assert _parse_numbers("1.25x10^9") == [("1.25x10^9", 1.25e9, "bare")]
+
+    chunks = [_chunk("c1", "2023年净利润1.25亿元。")]
+    passed, _ratio, verdicts = verify_answer("2023年净利润1.25×10^8元。[c1]", chunks)
+    assert passed, verdicts
+
+    passed, _ratio, _verdicts = verify_answer("2023年净利润1.25×10^9元。[c1]", chunks)
+    assert not passed

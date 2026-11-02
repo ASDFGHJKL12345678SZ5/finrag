@@ -38,6 +38,23 @@ _NUM = re.compile(
     r"(?![\d.])"
 )
 
+# 全角数字/符号 → 半角，1 字符对 1 字符，保证 raw/span 不变。
+_FULLWIDTH_TRANS = str.maketrans(
+    "０１２３４５６７８９．，％＋－ｅＥ　",
+    "0123456789.,%+-eE ",
+)
+
+# 1.25×10^9 / 1.25x10^9 / 1.25*10**9；必须在 _NUM 之前匹配，避免拆成 1.25、10、9。
+_SCI_NUM = re.compile(
+    r"(?<![\d.])"
+    r"(?P<sign>[+\-\u2212\uFF0D负正]?)"
+    r"(?P<mantissa>\d{1,3}(?:[,\uFF0C]\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)"
+    r"\s*[×xX*]\s*10\s*(?:\^|\*\*)?\s*"
+    r"(?P<exp>[+-]?\d+)"
+    r"(?:\s*(?P<unit>亿元|亿|万元|万|元|%))?"
+    r"(?![\d.])"
+)
+
 # 中文数字（含财务大写）。只有带量级/单位/“百分之”的才当数字，
 # 避免把“一个”里的“一”误识别成数据。
 _CN_DIGITS = {
@@ -87,15 +104,24 @@ _YEAR_OR_DATE_RE = re.compile(
 
 
 def _parse_chinese_number(text: str) -> float:
-    """把中文数字（含财务大写）转成 float；支持“点”小数，不支持口语省略。"""
+    """把中文数字（含财务大写）转成 float；支持“点”小数与口语省略。
+
+    口语规则：最后一个量级单位后只跟一个数字、且该单位后没有“零”时，
+    尾数落在下一级（一万二=12000，一百二=120）；有“零”则严格解析
+    （一万零二=10002，一百零二=102）。
+    """
     text = text.replace("萬", "万").replace("億", "亿")
     integer, _, decimal = text.partition("点")
     total = 0
     section = 0
     number = 0
+    last_unit = 0
+    zero_after_unit = False
     for ch in integer:
         if ch in _CN_DIGITS:
             number = _CN_DIGITS[ch]
+            if ch == "零":
+                zero_after_unit = True
         elif ch in _CN_UNITS:
             unit = _CN_UNITS[ch]
             if unit >= 10_000:
@@ -105,7 +131,12 @@ def _parse_chinese_number(text: str) -> float:
             else:
                 section += (number or 1) * unit
             number = 0
-    value = float(total + section + number)
+            last_unit = unit
+            zero_after_unit = False
+    if number and last_unit >= 10 and not zero_after_unit:
+        value = float(total + section + number * (last_unit // 10))
+    else:
+        value = float(total + section + number)
     if decimal:
         fraction = 0.0
         for i, ch in enumerate(decimal, 1):
@@ -133,7 +164,8 @@ def _is_chinese_number_candidate(match: re.Match[str]) -> bool:
 
 def _has_data_number(text: str) -> bool:
     """去掉年份/日期后还有没有数据数字。"""
-    return bool(_parse_numbers(_YEAR_OR_DATE_RE.sub("", text)))
+    normalized = text.translate(_FULLWIDTH_TRANS)
+    return bool(_parse_numbers(_YEAR_OR_DATE_RE.sub("", normalized)))
 
 
 def split_claims(answer: str) -> list[tuple[str, str]]:
@@ -375,12 +407,34 @@ def verify_answer(
 def _parse_numbers_ex(text: str) -> list[tuple[str, float, str, bool]]:
     """[(原始写法, 归一后的数值, 类别, 是否显式带符号)]。
 
-    支持：正负号、千分位（中英文逗号）、科学计数法、中文数字/财务大写。
-    中文数字只有带量级/单位/“百分之”才算，避免把“一个”里的“一”当数据。
+    支持：全角数字、正负号、千分位、e 计数法、×10^ 计数法、中文数字/财务大写。
+    raw 从原文切片，归一化不改变 1:1 字符位置。
     """
+    normalized = text.translate(_FULLWIDTH_TRANS)
     candidates: list[tuple[int, int, str, float, str, bool]] = []
 
-    for m in _NUM.finditer(text):
+    for m in _SCI_NUM.finditer(normalized):
+        sign_raw = m.group("sign") or ""
+        mantissa = m.group("mantissa").replace(",", "").replace("，", "")
+        try:
+            value = float(mantissa) * (10 ** int(m.group("exp")))
+        except (ValueError, OverflowError):
+            continue
+        if sign_raw in {"-", "\u2212", "\uFF0D", "负"}:
+            value = -value
+        unit = m.group("unit")
+        if unit == "%":
+            kind = "percent"
+        elif unit in _UNIT_FACTOR:
+            kind = "money"
+            value *= _UNIT_FACTOR[unit]
+        else:
+            kind = "bare"
+        candidates.append(
+            (m.start(), m.end(), text[m.start():m.end()], value, kind, bool(sign_raw))
+        )
+
+    for m in _NUM.finditer(normalized):
         sign_raw = m.group("sign") or ""
         num_raw = m.group("num")
         unit = m.group("unit")
@@ -398,10 +452,10 @@ def _parse_numbers_ex(text: str) -> list[tuple[str, float, str, bool]]:
         else:
             kind = "bare"
         candidates.append(
-            (m.start(), m.end(), m.group(0), value, kind, bool(sign_raw))
+            (m.start(), m.end(), text[m.start():m.end()], value, kind, bool(sign_raw))
         )
 
-    for m in _CN_NUM.finditer(text):
+    for m in _CN_NUM.finditer(normalized):
         if not _is_chinese_number_candidate(m):
             continue
         num_raw = m.group("num")
@@ -421,7 +475,7 @@ def _parse_numbers_ex(text: str) -> list[tuple[str, float, str, bool]]:
         else:
             kind = "bare"
         candidates.append(
-            (m.start(), m.end(), m.group(0), value, kind, bool(sign_raw))
+            (m.start(), m.end(), text[m.start():m.end()], value, kind, bool(sign_raw))
         )
 
     candidates.sort(key=lambda item: (item[0], -(item[1] - item[0])))
