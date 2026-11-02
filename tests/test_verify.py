@@ -4,7 +4,7 @@
 覆盖：引用归属、列表序号、无引用数字论断、幻觉数字、纯定性放行。
 """
 
-from app.rag.verify import split_claims, verify_answer
+from app.rag.verify import _parse_numbers, split_claims, verify_answer
 
 
 def _chunk(cid: str, text: str) -> dict:
@@ -315,3 +315,52 @@ def test_裸数字修复仍受问题年份约束():
     assert "[c2]" not in fixed
     passed, _ratio, _verdicts = verify_answer(fixed, chunks)
     assert not passed
+
+
+def test_负数解析且显式符号冲突被拒():
+    """负号不能丢；两侧都显式带符号且符号相反时必须拒。"""
+    assert _parse_numbers("净利润-12.5%") == [("-12.5%", -12.5, "percent")]
+    assert _parse_numbers("净利润负12.5%") == [("负12.5%", -12.5, "percent")]
+    chunks = [_chunk("c1", "净利润同比+12.5%。")]
+    passed, _ratio, verdicts = verify_answer("净利润同比-12.5%[c1]", chunks)
+    assert not passed
+    assert any("-12.5%" in v.missing for v in verdicts)
+
+
+def test_千分位与科学计数法可解析且等价():
+    assert _parse_numbers("1,250,000元") == [("1,250,000元", 1250000.0, "money")]
+    assert _parse_numbers("1.25e9元") == [("1.25e9元", 1250000000.0, "money")]
+
+    chunks = [_chunk("c1", "公司收入1,250,000元。")]
+    passed, _ratio, _verdicts = verify_answer("公司收入1250000元。[c1]", chunks)
+    assert passed
+
+    chunks = [_chunk("c1", "公司收入1.25e9元。")]
+    passed, _ratio, _verdicts = verify_answer("公司收入1250000000元。[c1]", chunks)
+    assert passed
+
+
+def test_中文数字与阿拉伯数字等价():
+    """一亿两千五百万元 == 1.25亿元；中文数字要进入 claim/校验。"""
+    assert _parse_numbers("一亿两千五百万元") == [
+        ("一亿两千五百万元", 125000000.0, "money")
+    ]
+    assert _parse_numbers("壹亿贰仟伍佰万元") == [
+        ("壹亿贰仟伍佰万元", 125000000.0, "money")
+    ]
+
+    chunks = [_chunk("c1", "2023年净利润1.25亿元。")]
+    answer = "2023年净利润一亿两千五百万元。[c1]"
+    assert split_claims(answer)
+    passed, _ratio, verdicts = verify_answer(answer, chunks)
+    assert passed, verdicts
+
+
+def test_中文数字幻觉不再静默通过():
+    """纯中文数字的幻觉不能被当成“无数字的定性回答”放行。"""
+    chunks = [_chunk("c1", "2023年净利润1.25亿元。")]
+    answer = "2023年净利润九亿九千万元。[c1]"
+    assert split_claims(answer)
+    passed, _ratio, verdicts = verify_answer(answer, chunks)
+    assert not passed
+    assert any("九亿九千万元" in v.missing for v in verdicts)

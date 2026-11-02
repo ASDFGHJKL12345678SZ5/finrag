@@ -27,9 +27,36 @@ from dataclasses import dataclass
 
 from app.rag.metric_lexicon import METRIC_GROUPS
 
-# 数字 + 可选单位。前后都排除数字/小数点：5 不能命中 56.4，20 不能命中 2025。
+# 数字 + 可选单位。支持显式正负号、千分位（中英文逗号）、科学计数法。
+# 前后都排除数字/小数点：5 不能命中 56.4，20 不能命中 2025。
 _NUM = re.compile(
-    r"(?<![\d.])(\d+(?:\.\d+)?)(?:\s*(亿元|亿|万元|万|元|%))?(?![\d.])"
+    r"(?<![\d.])"
+    r"(?P<sign>[+\-\u2212\uFF0D负正]?)"
+    r"(?P<num>(?:\d{1,3}(?:[,\uFF0C]\d{3})+|\d+)"
+    r"(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+    r"(?:\s*(?P<unit>亿元|亿|万元|万|元|%))?"
+    r"(?![\d.])"
+)
+
+# 中文数字（含财务大写）。只有带量级/单位/“百分之”的才当数字，
+# 避免把“一个”里的“一”误识别成数据。
+_CN_DIGITS = {
+    "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+    "壹": 1, "贰": 2, "叁": 3, "肆": 4, "伍": 5, "陆": 6,
+    "柒": 7, "捌": 8, "玖": 9,
+}
+_CN_SMALL_UNITS = {"十": 10, "百": 100, "千": 1000, "拾": 10, "佰": 100, "仟": 1000}
+_CN_BIG_UNITS = {"万": 10_000, "亿": 100_000_000, "萬": 10_000, "億": 100_000_000}
+_CN_UNITS = {**_CN_SMALL_UNITS, **_CN_BIG_UNITS}
+_CN_MAGNITUDE = set(_CN_UNITS)
+_CN_NUM = re.compile(
+    r"(?P<sign>[负正]?)"
+    r"(?P<prefix>百分之)?"
+    r"(?P<num>[零〇一二三四五六七八九十百千万亿两"
+    r"壹贰叁肆伍陆柒捌玖拾佰仟萬億]+"
+    r"(?:点[零〇一二三四五六七八九]+)?)"
+    r"(?:\s*(?P<unit>亿元|亿|万元|万|元|%))?"
 )
 
 # 无引用论断的哨兵：刻意不用中文状态词——改写查询按词形过滤 missing
@@ -59,14 +86,54 @@ _YEAR_OR_DATE_RE = re.compile(
 )
 
 
-def _has_data_number(text: str) -> bool:
-    """去掉年份/日期后还有没有数据数字。
+def _parse_chinese_number(text: str) -> float:
+    """把中文数字（含财务大写）转成 float；支持“点”小数，不支持口语省略。"""
+    text = text.replace("萬", "万").replace("億", "亿")
+    integer, _, decimal = text.partition("点")
+    total = 0
+    section = 0
+    number = 0
+    for ch in integer:
+        if ch in _CN_DIGITS:
+            number = _CN_DIGITS[ch]
+        elif ch in _CN_UNITS:
+            unit = _CN_UNITS[ch]
+            if unit >= 10_000:
+                section = (section + number) * unit
+                total += section
+                section = 0
+            else:
+                section += (number or 1) * unit
+            number = 0
+    value = float(total + section + number)
+    if decimal:
+        fraction = 0.0
+        for i, ch in enumerate(decimal, 1):
+            fraction += _CN_DIGITS.get(ch, 0) / (10 ** i)
+        value += fraction
+    return value
 
-    “你要查的是 2022 年的收入指标”只有一个年份，不是数据论断；早期版把它
-    当数字 claim，因无引用而整篇误杀（v2 abbr 5 题）。真正的数据句
-    “2022 年营收 982.68 亿元”去掉年份后仍有 982.68，照常校验。
-    """
-    return bool(_NUM.search(_YEAR_OR_DATE_RE.sub("", text)))
+
+def _is_chinese_number_candidate(match: re.Match[str]) -> bool:
+    """过滤“一个/二〇二三”这类非数据中文串，只保留带量级/单位/百分之的。"""
+    num = match.group("num")
+    if not num:
+        return False
+    if num in {"万", "亿", "萬", "億"} and match.group("unit") in {"元", "亿元"}:
+        return False  # “亿元/万元”是单位，不是数字
+    has_digit = any(ch in _CN_DIGITS for ch in num)
+    if not has_digit and num not in {"十", "百", "千"}:
+        return False
+    return bool(
+        match.group("prefix")
+        or match.group("unit")
+        or any(ch in _CN_MAGNITUDE for ch in num)
+    )
+
+
+def _has_data_number(text: str) -> bool:
+    """去掉年份/日期后还有没有数据数字。"""
+    return bool(_parse_numbers(_YEAR_OR_DATE_RE.sub("", text)))
 
 
 def split_claims(answer: str) -> list[tuple[str, str]]:
@@ -305,24 +372,81 @@ def verify_answer(
     return passed, ratio, verdicts
 
 
+def _parse_numbers_ex(text: str) -> list[tuple[str, float, str, bool]]:
+    """[(原始写法, 归一后的数值, 类别, 是否显式带符号)]。
+
+    支持：正负号、千分位（中英文逗号）、科学计数法、中文数字/财务大写。
+    中文数字只有带量级/单位/“百分之”才算，避免把“一个”里的“一”当数据。
+    """
+    candidates: list[tuple[int, int, str, float, str, bool]] = []
+
+    for m in _NUM.finditer(text):
+        sign_raw = m.group("sign") or ""
+        num_raw = m.group("num")
+        unit = m.group("unit")
+        try:
+            value = float(num_raw.replace(",", "").replace("，", ""))
+        except ValueError:
+            continue
+        if sign_raw in {"-", "\u2212", "\uFF0D", "负"}:
+            value = -value
+        if unit == "%":
+            kind = "percent"
+        elif unit in _UNIT_FACTOR:
+            kind = "money"
+            value *= _UNIT_FACTOR[unit]
+        else:
+            kind = "bare"
+        candidates.append(
+            (m.start(), m.end(), m.group(0), value, kind, bool(sign_raw))
+        )
+
+    for m in _CN_NUM.finditer(text):
+        if not _is_chinese_number_candidate(m):
+            continue
+        num_raw = m.group("num")
+        unit = m.group("unit")
+        try:
+            value = _parse_chinese_number(num_raw)
+        except (KeyError, ValueError):
+            continue
+        sign_raw = m.group("sign") or ""
+        if sign_raw == "负":
+            value = -value
+        if m.group("prefix") or unit == "%":
+            kind = "percent"
+        elif unit in _UNIT_FACTOR:
+            kind = "money"
+            value *= _UNIT_FACTOR[unit]
+        else:
+            kind = "bare"
+        candidates.append(
+            (m.start(), m.end(), m.group(0), value, kind, bool(sign_raw))
+        )
+
+    candidates.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    out: list[tuple[str, float, str, bool]] = []
+    last_end = -1
+    for start, end, raw, value, kind, signed in candidates:
+        if start < last_end:
+            continue
+        out.append((raw, value, kind, signed))
+        last_end = end
+    return out
+
+
 def _parse_numbers(text: str) -> list[tuple[str, float, str]]:
     """[(原始写法, 归一后的数值, 类别)]，类别 = percent / money / bare。"""
-    out: list[tuple[str, float, str]] = []
-    for m in _NUM.finditer(text):
-        raw_number, unit = m.group(1), m.group(2)
-        value = float(raw_number)
-        if unit == "%":
-            out.append((m.group(0), value, "percent"))
-        elif unit in _UNIT_FACTOR:
-            out.append((m.group(0), value * _UNIT_FACTOR[unit], "money"))
-        else:
-            out.append((m.group(0), value, "bare"))
-    return out
+    return [(raw, value, kind) for raw, value, kind, _signed in _parse_numbers_ex(text)]
 
 
 def _same_number(
     value: float, kind: str, other_value: float, other_kind: str
 ) -> bool:
+    # 数值本身按绝对值比较：金融文本常把“下降 12.5%”写成 12.5%，
+    # 显式正负号冲突由 _missing_evidence 在 claim/evidence 两侧都带符号时判定。
+    value = abs(value)
+    other_value = abs(other_value)
     # 百分比只和百分比比：5% 不能拿 5（元/亿元）顶替
     if kind == "percent" or other_kind == "percent":
         return kind == other_kind and abs(value - other_value) <= 1e-9
@@ -337,15 +461,26 @@ def _missing_evidence(claim: str, evidence: str) -> list[str]:
     两层检查，严格程度不同：
     1. 数字（硬门禁）：论断里的每个数字都必须在被引证据里按**边界 + 单位**
        找到——模型编的数字几乎不可能恰好出现在语料里，这一层拦最高危的幻觉。
+       显式符号只在 claim/evidence 两侧都带符号时比较；一侧是“下降12.5%”
+       这种文字方向、另一侧写“-12.5%”时，按绝对值放行，避免误杀。
     2. 内容词（软门禁）：把论断切中文二元组，至少 2 个要能在证据里
        找到——防止"数字碰巧对上但话题完全不对"的张冠李戴。
        软门禁不要求全部命中：答案的引导语（"根据检索到的研报内容："）
        不是论断内容，逐词要求全中会把正常答案误杀（实测踩坑）。
     """
     missing: list[str] = []
-    evidence_numbers = _parse_numbers(evidence)
-    for raw, value, kind in _parse_numbers(claim):
-        if not any(_same_number(value, kind, ev, ek) for _, ev, ek in evidence_numbers):
+    evidence_numbers = _parse_numbers_ex(evidence)
+    for raw, value, kind, signed in _parse_numbers_ex(claim):
+        matched = any(
+            _same_number(value, kind, ev, ek)
+            and not (
+                signed
+                and ev_signed
+                and (value < 0) != (ev < 0)
+            )
+            for _, ev, ek, ev_signed in evidence_numbers
+        )
+        if not matched:
             missing.append(raw)
     bigrams = _content_bigrams(claim)
     hits = sum(1 for g in bigrams if g in evidence)
